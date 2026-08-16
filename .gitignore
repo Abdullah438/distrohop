@@ -1,0 +1,8 @@
+# Snapshot payloads that do not belong on a public remote.
+snapshots/**/dev/envs/
+snapshots/**/dev/volumes/
+snapshots/**/dev/bind/
+snapshots/**/dev/dump.pm2
+snapshots/**/secrets/
+snapshots/**/*.tar.zst
+snapshots/**/*.tar.xz

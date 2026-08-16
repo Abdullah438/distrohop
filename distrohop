@@ -1,0 +1,814 @@
+#!/usr/bin/env bash
+# distrohop — snapshot the configs that survive a distro hop, then put them back.
+set -euo pipefail
+
+VERSION="1.1.0"
+
+SOURCE=${BASH_SOURCE[0]}
+while [[ -L $SOURCE ]]; do
+  _dir=$(cd "$(dirname "$SOURCE")" && pwd)
+  SOURCE=$(readlink "$SOURCE")
+  [[ $SOURCE != /* ]] && SOURCE="$_dir/$SOURCE"
+done
+SCRIPT_DIR=$(cd "$(dirname "$SOURCE")" && pwd)
+unset _dir SOURCE
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/distrohop"
+DATA_DIR="${DISTROHOP_DIR:-$HOME/Backups/distrohop}"
+MANIFEST="$CONFIG_DIR/manifest.conf"
+
+DEFAULT_GROUPS=(core apps gtk editor wallpapers packages dev)
+ALL_FILE_GROUPS=(core apps gtk editor wallpapers themes secrets kde extra)
+
+DRY_RUN=0
+WANT_SECRETS=0
+WANT_ARCHIVE=0
+WANT_UP=0
+DEST_OVERRIDE=""
+NAME_OVERRIDE=""
+GROUPS_OVERRIDE=""
+
+if [[ -t 1 ]]; then
+  C_RESET=$'\033[0m'
+  C_BOLD=$'\033[1m'
+  C_DIM=$'\033[2m'
+  C_RED=$'\033[31m'
+  C_GRN=$'\033[32m'
+  C_YEL=$'\033[33m'
+  C_BLU=$'\033[34m'
+  C_CYN=$'\033[36m'
+else
+  C_RESET= C_BOLD= C_DIM= C_RED= C_GRN= C_YEL= C_BLU= C_CYN=
+fi
+
+ok()   { printf '%s%s%s %s\n' "$C_GRN" "✔" "$C_RESET" "$*"; }
+info() { printf '%s%s%s %s\n' "$C_BLU" "→" "$C_RESET" "$*"; }
+warn() { printf '%s%s%s %s\n' "$C_YEL" "!" "$C_RESET" "$*" >&2; }
+err()  { printf '%s%s%s %s\n' "$C_RED" "✖" "$C_RESET" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+
+usage() {
+  cat <<EOF
+${C_BOLD}distrohop${C_RESET} ${C_DIM}v$VERSION${C_RESET} — backup the configs that survive a distro hop
+
+${C_BOLD}USAGE${C_RESET}
+  distrohop backup  [--name NAME] [--dest DIR] [--groups LIST] [--secrets] [--archive]
+  distrohop restore SNAPSHOT [--groups LIST] [--secrets] [--up] [--dry-run]
+  distrohop clone   [SNAPSHOT] [--dry-run]
+  distrohop list
+  distrohop show    SNAPSHOT
+  distrohop status  [--groups LIST]
+  distrohop packages dump | apply [--portable] [--dry-run]
+  distrohop bootstrap [--dry-run]
+  distrohop dconf   export | import [FILE]
+  distrohop edit
+  distrohop install
+
+${C_BOLD}BACKUP GROUPS${C_RESET}  (default: ${DEFAULT_GROUPS[*]})
+  core         zsh, p10k, bash, git, nano
+  apps         fastfetch, alacritty, btop, cava, micro, fontconfig, gh, systemd units
+  gtk          gtk-3/4 settings
+  editor       Cursor settings.json
+  wallpapers   ~/.local/share/wallpapers
+  packages     pacman / AUR / flatpak lists (always dumped on backup)
+  dev          ~/Dev clone map (GitHub remotes + folder tree), .env files, docker volumes
+  themes       icon / cursor themes  ${C_DIM}(large — opt-in)${C_RESET}
+  secrets      ssh private keys, gh hosts, rclone.conf  ${C_DIM}(opt-in)${C_RESET}
+  kde          Plasma / Kwin / Konsole configs  ${C_DIM}(opt-in)${C_RESET}
+  extra        whatever you add under [extra] in the manifest
+
+${C_BOLD}EXAMPLES${C_RESET}
+  distrohop backup --name workstation
+  distrohop backup --dest /run/media/$USER/USB --archive --secrets
+  distrohop restore workstation --up
+  distrohop clone workstation
+  distrohop packages apply --portable
+  distrohop bootstrap
+
+Snapshots land in ${C_CYN}$DATA_DIR${C_RESET}
+Edit what gets copied: ${C_CYN}distrohop edit${C_RESET}
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Manifest
+# ---------------------------------------------------------------------------
+
+ensure_manifest() {
+  mkdir -p "$CONFIG_DIR"
+  if [[ ! -f $MANIFEST ]]; then
+    if [[ -f $SCRIPT_DIR/manifest.conf ]]; then
+      cp "$SCRIPT_DIR/manifest.conf" "$MANIFEST"
+    else
+      die "no manifest at $MANIFEST and no bundled copy next to the script"
+    fi
+    info "wrote default manifest → $MANIFEST"
+  fi
+}
+
+# parse_manifest GROUP → prints paths (one per line)
+parse_manifest() {
+  local want=$1 current="" line
+  while IFS= read -r line || [[ -n $line ]]; do
+    line=${line%%#*}
+    line=${line%"${line##*[![:space:]]}"}
+    line=${line#"${line%%[![:space:]]*}"}
+    [[ -z $line ]] && continue
+    if [[ $line =~ ^\[([^]]+)\]$ ]]; then
+      current=${BASH_REMATCH[1]}
+      continue
+    fi
+    [[ $current == "$want" ]] && printf '%s\n' "$line"
+  done < "$MANIFEST"
+}
+
+active_groups() {
+  local raw=${GROUPS_OVERRIDE:-${DEFAULT_GROUPS[*]}}
+  raw=${raw//,/ }
+  # --secrets implies the secrets group
+  if (( WANT_SECRETS )); then
+    [[ " $raw " == *" secrets "* ]] || raw+=" secrets"
+  fi
+  printf '%s\n' $raw
+}
+
+group_wanted() {
+  local g=$1 x
+  for x in $(active_groups); do
+    [[ $x == "$g" ]] && return 0
+  done
+  return 1
+}
+
+# shellcheck source=lib/dev.sh
+if [[ -f $SCRIPT_DIR/lib/dev.sh ]]; then
+  source "$SCRIPT_DIR/lib/dev.sh"
+fi
+
+# ---------------------------------------------------------------------------
+# Copy helpers
+# ---------------------------------------------------------------------------
+
+RSYNC_EXCLUDES=(
+  --exclude='*.bak'
+  --exclude='*.old'
+  --exclude='__pycache__'
+  --exclude='buffers/'
+  --exclude='backups/'
+  --exclude='*.wants/'
+  --exclude='known_hosts.old'
+)
+
+item_exists() {
+  local p=$1
+  [[ -e $p || -L $p ]]
+}
+
+copy_item() {
+  local rel=$1 dest_root=$2
+  local src="$HOME/$rel" dest="$dest_root/$rel"
+  if ! item_exists "$src"; then
+    warn "skip (missing): ~/$rel"
+    return 1
+  fi
+  if (( DRY_RUN )); then
+    printf '  %s\n' "~/$rel"
+    return 0
+  fi
+  mkdir -p "$(dirname "$dest")"
+  if [[ -d $src && ! -L $src ]]; then
+    mkdir -p "$dest"
+    rsync -a "${RSYNC_EXCLUDES[@]}" "$src/" "$dest/"
+  else
+    rsync -a "${RSYNC_EXCLUDES[@]}" "$src" "$dest"
+  fi
+}
+
+restore_item() {
+  local rel=$1 src_root=$2
+  local src="$src_root/$rel" dest="$HOME/$rel"
+  if ! item_exists "$src"; then
+    return 1
+  fi
+  if (( DRY_RUN )); then
+    printf '  %s → ~/%s\n' "$rel" "$rel"
+    return 0
+  fi
+  mkdir -p "$(dirname "$dest")"
+  if [[ -e $dest || -L $dest ]]; then
+    local bak="${dest}.pre-hop.$(date +%Y%m%d%H%M%S)"
+    if [[ -d $dest && ! -L $dest ]]; then
+      mkdir -p "$bak"
+      rsync -a "$dest/" "$bak/"
+    else
+      cp -a "$dest" "$bak"
+    fi
+  fi
+  if [[ -d $src && ! -L $src ]]; then
+    mkdir -p "$dest"
+    rsync -a "$src/" "$dest/"
+  else
+    rsync -a "$src" "$dest"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Packages
+# ---------------------------------------------------------------------------
+
+KDE_SESSION_RE='^(bluedevil|breeze(-.*)?|cachyos-.*kde.*|cachyos-kde-settings|kde-gtk-config|kdeplasma-addons|kscreen|kwallet.*|kwin.*|oxygen(-.*)?|phonon-.*|plasma-.*|plymouth-kcm|powerdevil)$'
+KDE_APPS_RE='^(ark|dolphin|ffmpegthumbs|filelight|gwenview|haruna|kate|kcalc|kdeconnect|kdegraphics-thumbnailers|kdialog|kinfocenter|kio-admin|konsole|partitionmanager|spectacle)$'
+
+is_kde_session() { [[ $1 =~ $KDE_SESSION_RE ]]; }
+is_kde_app()     { [[ $1 =~ $KDE_APPS_RE ]]; }
+
+dump_packages() {
+  local out=$1
+  mkdir -p "$out"
+
+  if command -v pacman >/dev/null 2>&1; then
+    pacman -Qqe > "$out/explicit.txt"
+    pacman -Qqm > "$out/aur.txt" 2>/dev/null || : > "$out/aur.txt"
+    : > "$out/portable.txt"
+    : > "$out/kde-session.txt"
+    : > "$out/kde-apps.txt"
+    local pkg
+    while IFS= read -r pkg; do
+      [[ -z $pkg ]] && continue
+      if is_kde_session "$pkg"; then
+        printf '%s\n' "$pkg" >> "$out/kde-session.txt"
+      elif is_kde_app "$pkg"; then
+        printf '%s\n' "$pkg" >> "$out/kde-apps.txt"
+      else
+        printf '%s\n' "$pkg" >> "$out/portable.txt"
+      fi
+    done < "$out/explicit.txt"
+  else
+    warn "pacman not found — skipped Arch package lists"
+  fi
+
+  if command -v flatpak >/dev/null 2>&1; then
+    flatpak list --app --columns=application > "$out/flatpak.txt" 2>/dev/null || : > "$out/flatpak.txt"
+  else
+    : > "$out/flatpak.txt"
+  fi
+
+}
+
+write_notes() {
+  local snap=$1
+  local host os de
+  host=$(hostname 2>/dev/null || echo unknown)
+  os=$(grep -E '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d= -f2- | tr -d '"')
+  de=${XDG_CURRENT_DESKTOP:-unknown}
+
+  cat > "$snap/NOTES.txt" <<EOF
+distrohop snapshot
+==================
+date:     $(date -Iseconds)
+host:     $host
+os:       ${os:-unknown}
+desktop:  $de
+home:     $HOME
+groups:   $(active_groups | tr '\n' ' ')
+
+Restore on the new machine
+--------------------------
+1. Copy this folder (or the .tar.zst) onto the new install.
+2. Put distrohop on PATH (or run it from this repo):
+     ./distrohop install
+3. Restore configs (existing files are saved as *.pre-hop.*):
+     distrohop restore $snap
+4. Reinstall the shell stack (zsh, p10k, plugins, fonts):
+     distrohop bootstrap
+5. Reinstall portable packages (DE session packages are listed separately):
+     distrohop packages apply --portable
+
+Notes
+-----
+- zshrc sources system paths (/usr/share/oh-my-zsh, p10k, zsh plugins).
+  bootstrap installs those on Arch. Other distros need the equivalents
+  or a user-local oh-my-zsh.
+- git commit signing uses ~/.ssh/id_ed25519_gitsign — restore with --secrets
+  or copy that key by hand.
+- terminal-news: after restore,
+    systemctl --user daemon-reload
+    systemctl --user enable --now terminal-news.timer
+- The [kde] group is off by default. Pass --groups kde only if you want
+  those desktop configs on the next install.
+
+~/Dev
+-----
+Git repos are NOT copied. The snapshot records remotes + folder layout.
+On the new machine:
+
+    distrohop clone $snap
+    # or:  $snap/dev/clone-dev.sh
+
+That recreates ~/Dev/Fullstack/khata, ~/Dev/Python/myed-backend, etc. and
+clones each GitHub remote into place. Private parami-ai remotes need
+gh auth or SSH keys (--secrets).
+
+.env files, compose bind-mounts, and named docker volumes live under
+dev/envs, dev/bind, dev/volumes. They are gitignored on purpose — keep
+them off a public remote. Restore brings them back automatically.
+Then start stacks with:  distrohop restore $snap --up
+
+Secrets
+-------
+SSH private keys, gh hosts.yml, and rclone.conf are only in this snapshot
+if you passed --secrets. They live under secrets/ and restore only with
+the same flag.
+EOF
+}
+
+write_meta() {
+  local snap=$1
+  mkdir -p "$snap/meta"
+  hostname > "$snap/meta/hostname" 2>/dev/null || echo unknown > "$snap/meta/hostname"
+  cp /etc/os-release "$snap/meta/os-release" 2>/dev/null || true
+  printf '%s\n' "${XDG_CURRENT_DESKTOP:-unknown}" > "$snap/meta/desktop"
+  date -Iseconds > "$snap/meta/date"
+  uname -a > "$snap/meta/uname"
+  printf '%s\n' "$HOME" > "$snap/meta/home"
+  printf '%s\n' "$VERSION" > "$snap/meta/distrohop-version"
+  active_groups > "$snap/meta/groups"
+}
+
+# ---------------------------------------------------------------------------
+# Resolve a snapshot argument to a directory
+# ---------------------------------------------------------------------------
+
+resolve_snapshot() {
+  local arg=$1
+  local cand
+  if [[ -d $arg && ( -d $arg/files || -d $arg/dev ) ]]; then
+    printf '%s\n' "$(cd "$arg" && pwd)"
+    return
+  fi
+  if [[ -f $arg && $arg == *.tar.* ]]; then
+    die "packed snapshots: extract first, e.g.  tar -C $(dirname "$arg") -xf $arg"
+  fi
+  for cand in "$arg" "$DATA_DIR/$arg" "$DATA_DIR/$arg"* "$SCRIPT_DIR/snapshots/$arg"; do
+    if [[ -d $cand && -d $cand/files ]]; then
+      printf '%s\n' "$(cd "$cand" && pwd)"
+      return
+    fi
+  done
+  die "snapshot not found: $arg  (try: distrohop list)"
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+cmd_install() {
+  local dest="$HOME/.local/bin/distrohop"
+  mkdir -p "$HOME/.local/bin"
+  ln -sfn "$SCRIPT_DIR/distrohop" "$dest"
+  ensure_manifest
+  ok "linked $dest → $SCRIPT_DIR/distrohop"
+  if [[ :$PATH: != *":$HOME/.local/bin:"* ]]; then
+    warn "~/.local/bin is not on PATH — add it, or open a new terminal"
+  fi
+}
+
+cmd_edit() {
+  ensure_manifest
+  local editor=${EDITOR:-${VISUAL:-nano}}
+  exec "$editor" "$MANIFEST"
+}
+
+cmd_status() {
+  ensure_manifest
+  printf '%sWhat would be copied%s  groups: %s%s%s\n\n' \
+    "$C_BOLD" "$C_RESET" "$C_CYN" "$(active_groups | tr '\n' ' ')" "$C_RESET"
+
+  local g rel src bytes=0 count=0 missing=0
+  for g in "${ALL_FILE_GROUPS[@]}"; do
+    group_wanted "$g" || continue
+    local shown=0
+    while IFS= read -r rel; do
+      [[ -z $rel ]] && continue
+      src="$HOME/$rel"
+      if item_exists "$src"; then
+        ((shown)) || { printf '%s[%s]%s\n' "$C_BOLD" "$g" "$C_RESET"; shown=1; }
+        local sz
+        sz=$(du -sh "$src" 2>/dev/null | awk '{print $1}')
+        printf '  %-42s %s\n' "~/$rel" "$sz"
+        count=$((count + 1))
+      else
+        ((shown)) || { printf '%s[%s]%s\n' "$C_BOLD" "$g" "$C_RESET"; shown=1; }
+        printf '  %s%-42s missing%s\n' "$C_DIM" "~/$rel" "$C_RESET"
+        missing=$((missing + 1))
+      fi
+    done < <(parse_manifest "$g")
+    ((shown)) && printf '\n'
+  done
+
+  if group_wanted packages && command -v pacman >/dev/null 2>&1; then
+    printf '%s[packages]%s\n' "$C_BOLD" "$C_RESET"
+    printf '  explicit  %s\n' "$(pacman -Qqe | wc -l)"
+    printf '  aur       %s\n' "$(pacman -Qqm | wc -l)"
+    printf '  flatpak   %s\n' "$(flatpak list --app 2>/dev/null | wc -l)"
+    printf '\n'
+  fi
+
+  if declare -F dev_status >/dev/null; then
+    dev_status
+  fi
+
+  info "$count present, $missing missing"
+  info "destination: ${DEST_OVERRIDE:-$DATA_DIR}"
+}
+
+cmd_backup() {
+  ensure_manifest
+  mkdir -p "${DEST_OVERRIDE:-$DATA_DIR}"
+
+  local stamp host name dest
+  stamp=$(date +%Y-%m-%d_%H%M%S)
+  host=$(hostname -s 2>/dev/null || hostname)
+  name=${NAME_OVERRIDE:-${stamp}_${host}}
+  dest="${DEST_OVERRIDE:-$DATA_DIR}/$name"
+
+  if [[ -e $dest ]]; then
+    die "already exists: $dest"
+  fi
+
+  info "snapshot → $dest"
+  info "groups:   $(active_groups | tr '\n' ' ')"
+
+  if (( DRY_RUN )); then
+    cmd_status
+    return 0
+  fi
+
+  mkdir -p "$dest/files"
+  write_meta "$dest"
+  dump_packages "$dest/packages"
+  write_notes "$dest"
+
+  local g rel copied=0
+  : > "$dest/MANIFEST.txt"
+  for g in "${ALL_FILE_GROUPS[@]}"; do
+    group_wanted "$g" || continue
+    [[ $g == secrets ]] && continue
+    while IFS= read -r rel; do
+      [[ -z $rel ]] && continue
+      if copy_item "$rel" "$dest/files"; then
+        printf '%s\t%s\n' "$g" "$rel" >> "$dest/MANIFEST.txt"
+        copied=$((copied + 1))
+      fi
+    done < <(parse_manifest "$g")
+  done
+
+  if group_wanted secrets; then
+    mkdir -p "$dest/secrets"
+    while IFS= read -r rel; do
+      [[ -z $rel ]] && continue
+      if copy_item "$rel" "$dest/secrets"; then
+        printf '%s\t%s\n' "secrets" "$rel" >> "$dest/MANIFEST.txt"
+        copied=$((copied + 1))
+      fi
+    done < <(parse_manifest secrets)
+    chmod -R go= "$dest/secrets" 2>/dev/null || true
+  fi
+
+  if group_wanted dev && declare -F dev_backup >/dev/null; then
+    dev_backup "$dest"
+  fi
+
+  if (( WANT_ARCHIVE )); then
+    local archive="${dest}.tar.zst"
+    info "packing $archive"
+    if command -v zstd >/dev/null 2>&1; then
+      tar -C "$(dirname "$dest")" -I 'zstd -T0 -19' -cf "$archive" "$(basename "$dest")"
+    else
+      archive="${dest}.tar.xz"
+      tar -C "$(dirname "$dest")" -cJf "$archive" "$(basename "$dest")"
+    fi
+    ok "archive $(du -sh "$archive" | awk '{print $1}')  $archive"
+  fi
+
+  ok "copied $copied items  $(du -sh "$dest" | awk '{print $1}')"
+  printf '\n%sNext%s\n' "$C_BOLD" "$C_RESET"
+  printf '  restore:   distrohop restore %s\n' "$name"
+  printf '  portable:  %s packages\n' "$(wc -l < "$dest/packages/portable.txt")"
+  printf '  desktop:   %s DE-session packages (packages/kde-session.txt)\n' "$(wc -l < "$dest/packages/kde-session.txt")"
+  if ! group_wanted secrets; then
+    warn "secrets not included — rerun with --secrets to keep ssh keys / rclone"
+  fi
+}
+
+cmd_list() {
+  local dir=${DEST_OVERRIDE:-$DATA_DIR}
+  if [[ ! -d $dir ]]; then
+    warn "no snapshots yet in $dir"
+    return 0
+  fi
+  local d
+  printf '%s%-28s %8s  %s%s\n' "$C_DIM" "NAME" "SIZE" "WHEN" "$C_RESET"
+  shopt -s nullglob
+  for d in "$dir"/*/; do
+    [[ -d $d/files || -d $d/meta ]] || continue
+    local name when size
+    name=$(basename "$d")
+    when=$(cat "$d/meta/date" 2>/dev/null || echo "?")
+    size=$(du -sh "$d" | awk '{print $1}')
+    printf '%-28s %8s  %s\n' "$name" "$size" "$when"
+  done
+  shopt -u nullglob
+}
+
+cmd_show() {
+  local snap
+  snap=$(resolve_snapshot "${1:-}")
+  printf '%s%s%s\n\n' "$C_BOLD" "$(basename "$snap")" "$C_RESET"
+  if [[ -f $snap/NOTES.txt ]]; then
+    cat "$snap/NOTES.txt"
+    printf '\n'
+  fi
+  if [[ -f $snap/MANIFEST.txt ]]; then
+    printf '%sContents%s\n' "$C_BOLD" "$C_RESET"
+    column -t -s $'\t' "$snap/MANIFEST.txt"
+  fi
+}
+
+cmd_restore() {
+  local snap
+  snap=$(resolve_snapshot "${1:-}")
+  ensure_manifest
+
+  local orig_home
+  orig_home=$(cat "$snap/meta/home" 2>/dev/null || echo "")
+  if [[ -n $orig_home && $orig_home != "$HOME" ]]; then
+    warn "snapshot was taken from $orig_home — restoring into $HOME"
+  fi
+
+  info "restore ← $snap"
+  info "groups:   $(active_groups | tr '\n' ' ')"
+  (( DRY_RUN )) && warn "dry-run — nothing will be written"
+
+  local g rel restored=0
+  if [[ -f $snap/MANIFEST.txt ]]; then
+    while IFS=$'\t' read -r g rel; do
+      [[ -z ${rel:-} ]] && continue
+      [[ $g == secrets ]] && continue
+      group_wanted "$g" || continue
+      if restore_item "$rel" "$snap/files"; then
+        restored=$((restored + 1))
+      fi
+    done < "$snap/MANIFEST.txt"
+  else
+    # fallback: copy the whole files/ tree
+    if (( DRY_RUN )); then
+      rsync -a -n "$snap/files/" "$HOME/"
+    else
+      rsync -a --backup --suffix=".pre-hop.$(date +%Y%m%d%H%M%S)" "$snap/files/" "$HOME/"
+    fi
+    restored=1
+  fi
+
+  if group_wanted secrets; then
+    if [[ -d $snap/secrets ]]; then
+      while IFS=$'\t' read -r g rel; do
+        [[ $g == secrets ]] || continue
+        restore_item "$rel" "$snap/secrets" && restored=$((restored + 1))
+      done < "$snap/MANIFEST.txt"
+    else
+      warn "this snapshot has no secrets/ — it was created without --secrets"
+    fi
+  fi
+
+  if group_wanted dev && declare -F dev_restore >/dev/null; then
+    dev_restore "$snap"
+  fi
+
+  if (( ! DRY_RUN )); then
+    if [[ -d $HOME/.config/systemd/user ]]; then
+      systemctl --user daemon-reload 2>/dev/null || true
+    fi
+    ok "restored $restored items"
+    info "existing files were saved as *.pre-hop.*"
+    info "next: distrohop bootstrap   then   distrohop packages apply --portable"
+  else
+    ok "dry-run finished ($restored items would restore)"
+  fi
+}
+
+cmd_clone() {
+  local snap
+  if [[ -n ${1:-} ]]; then
+    snap=$(resolve_snapshot "$1")
+  else
+    snap=$(ls -1d "${DEST_OVERRIDE:-$DATA_DIR}"/*/ 2>/dev/null | tail -n1 || true)
+    [[ -n $snap ]] || die "no snapshot found — pass one: distrohop clone workstation"
+  fi
+  [[ -x $snap/dev/clone-dev.sh ]] || die "no clone map in $snap (backup with the dev group)"
+  info "rebuilding $DEV_ROOT from $(basename "$snap")"
+  if (( DRY_RUN )); then
+    "$snap/dev/clone-dev.sh" --dry-run
+  else
+    "$snap/dev/clone-dev.sh"
+  fi
+}
+
+cmd_packages_dump() {
+  local out="${DEST_OVERRIDE:-$DATA_DIR}/packages-$(date +%Y-%m-%d)"
+  mkdir -p "$out"
+  dump_packages "$out"
+  ok "wrote package lists → $out"
+  ls -1 "$out"
+}
+
+cmd_packages_apply() {
+  local portable=${1:-0}
+  if ! command -v pacman >/dev/null 2>&1; then
+    die "package apply is implemented for Arch/CachyOS (pacman). On other distros, read packages/portable.txt and install equivalents."
+  fi
+
+  local snap_dir="" list
+  # Prefer the newest snapshot's lists
+  if [[ -n ${2:-} ]]; then
+    snap_dir=$(resolve_snapshot "$2")
+  else
+    snap_dir=$(ls -1d "${DEST_OVERRIDE:-$DATA_DIR}"/*/ 2>/dev/null | tail -n1 || true)
+  fi
+  [[ -n $snap_dir && -d $snap_dir/packages ]] || die "no snapshot package lists found — run backup first"
+
+  if (( portable )); then
+    list="$snap_dir/packages/portable.txt"
+    info "installing portable packages (DE-session list skipped)"
+  else
+    list="$snap_dir/packages/explicit.txt"
+    warn "installing the FULL explicit list, including DE-session packages"
+  fi
+  [[ -f $list ]] || die "missing $list"
+
+  local pkgs=()
+  mapfile -t pkgs < <(grep -vE '^\s*(#|$)' "$list")
+  ((${#pkgs[@]})) || die "package list is empty"
+
+  info "${#pkgs[@]} packages from $(basename "${snap_dir%/}")"
+  if (( DRY_RUN )); then
+    printf '%s\n' "${pkgs[@]}"
+    return 0
+  fi
+
+  sudo pacman -S --needed -- "${pkgs[@]}" || warn "some repo packages failed (normal if you changed distro flavour)"
+
+  if [[ -f $snap_dir/packages/aur.txt ]] && command -v paru >/dev/null 2>&1; then
+    local aur=()
+    if (( portable )); then
+      mapfile -t aur < <(grep -vE '^\s*(#|$)' "$snap_dir/packages/aur.txt" | while read -r p; do
+        is_kde_session "$p" && continue
+        printf '%s\n' "$p"
+      done)
+    else
+      mapfile -t aur < <(grep -vE '^\s*(#|$)' "$snap_dir/packages/aur.txt")
+    fi
+    if ((${#aur[@]})); then
+      info "AUR via paru: ${aur[*]}"
+      paru -S --needed -- "${aur[@]}" || warn "some AUR packages failed"
+    fi
+  fi
+
+  if [[ -s $snap_dir/packages/flatpak.txt ]] && command -v flatpak >/dev/null 2>&1; then
+    local app
+    while IFS= read -r app; do
+      [[ -z $app ]] && continue
+      info "flatpak $app"
+      flatpak install -y --noninteractive "$app" 2>/dev/null || warn "flatpak failed: $app"
+    done < "$snap_dir/packages/flatpak.txt"
+  fi
+
+  ok "package apply finished"
+}
+
+cmd_bootstrap() {
+  if ! command -v pacman >/dev/null 2>&1; then
+    die "bootstrap knows Arch/CachyOS package names. Install zsh + p10k + plugins by hand on this distro."
+  fi
+
+  local repo=(
+    zsh
+    zsh-theme-powerlevel10k
+    zsh-syntax-highlighting
+    zsh-autosuggestions
+    zsh-history-substring-search
+    fzf
+    bat
+    trash-cli
+    fastfetch
+    alacritty
+    pkgfile
+    ttf-meslo-nerd
+    ttf-jetbrains-mono-nerd
+    git
+    github-cli
+  )
+  local aur=(oh-my-zsh-git ttf-victor-mono)
+
+  info "shell + prompt + fonts that your zshrc expects"
+  if (( DRY_RUN )); then
+    printf 'pacman: %s\n' "${repo[*]}"
+    printf 'aur:    %s\n' "${aur[*]}"
+    return 0
+  fi
+
+  sudo pacman -S --needed -- "${repo[@]}"
+  if command -v paru >/dev/null 2>&1; then
+    paru -S --needed -- "${aur[@]}"
+  else
+    warn "paru not found — install oh-my-zsh-git and ttf-victor-mono from the AUR yourself"
+  fi
+
+  if [[ $SHELL != *zsh ]]; then
+    info "switching login shell to zsh"
+    chsh -s /usr/bin/zsh || warn "chsh failed — run: chsh -s /usr/bin/zsh"
+  fi
+  ok "bootstrap done — open a new terminal"
+}
+
+cmd_dconf() {
+  local sub=${1:-}
+  local file=${2:-$HOME/.config/distrohop/dconf.ini}
+  case $sub in
+    export)
+      command -v dconf >/dev/null 2>&1 || die "dconf not installed"
+      mkdir -p "$(dirname "$file")"
+      dconf dump / > "$file"
+      ok "dumped dconf → $file"
+      ;;
+    import)
+      command -v dconf >/dev/null 2>&1 || die "dconf not installed"
+      [[ -f $file ]] || die "no dump at $file — run: distrohop dconf export"
+      dconf load / < "$file"
+      ok "loaded $file into dconf"
+      ;;
+    *)
+      die "usage: distrohop dconf export|import [FILE]"
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Arg parse
+# ---------------------------------------------------------------------------
+
+PORTABLE=0
+POSITIONAL=()
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -h|--help) usage; exit 0 ;;
+    -V|--version) printf '%s\n' "$VERSION"; exit 0 ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --secrets) WANT_SECRETS=1; shift ;;
+    --archive) WANT_ARCHIVE=1; shift ;;
+    --up) WANT_UP=1; shift ;;
+    --portable) PORTABLE=1; shift ;;
+    --name) NAME_OVERRIDE=${2:?}; shift 2 ;;
+    --dest) DEST_OVERRIDE=${2:?}; shift 2 ;;
+    --groups) GROUPS_OVERRIDE=${2:?}; shift 2 ;;
+    --) shift; POSITIONAL+=("$@"); break ;;
+    -*) die "unknown flag: $1" ;;
+    *) POSITIONAL+=("$1"); shift ;;
+  esac
+done
+
+set -- "${POSITIONAL[@]+"${POSITIONAL[@]}"}"
+cmd=${1:-help}
+shift || true
+
+case $cmd in
+  help) usage ;;
+  install) cmd_install ;;
+  edit) cmd_edit ;;
+  status) cmd_status ;;
+  backup) cmd_backup ;;
+  list) cmd_list ;;
+  show)
+    [[ $# -ge 1 ]] || die "usage: distrohop show SNAPSHOT"
+    cmd_show "$1"
+    ;;
+  restore)
+    [[ $# -ge 1 ]] || die "usage: distrohop restore SNAPSHOT"
+    cmd_restore "$1"
+    ;;
+  clone)
+    cmd_clone "${1:-}"
+    ;;
+  packages)
+    sub=${1:-}
+    case $sub in
+      dump) cmd_packages_dump ;;
+      apply) cmd_packages_apply "$PORTABLE" "${2:-}" ;;
+      *) die "usage: distrohop packages dump|apply [--portable]" ;;
+    esac
+    ;;
+  bootstrap) cmd_bootstrap ;;
+  dconf) cmd_dconf "${1:-}" "${2:-}" ;;
+  *) die "unknown command: $cmd  (try: distrohop help)" ;;
+esac
