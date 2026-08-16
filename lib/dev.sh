@@ -79,7 +79,13 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 DEV_ROOT="${DISTROHOP_DEV:-$HOME/Dev}"
 LIST="$HERE/repos.tsv"
 DRY=0
-[[ ${1:-} == --dry-run ]] && DRY=1
+USE_GH=0
+for arg in "$@"; do
+  case $arg in
+    --dry-run) DRY=1 ;;
+    --gh)      USE_GH=1 ;;
+  esac
+done
 
 if [[ ! -f $LIST ]]; then
   echo "missing $LIST" >&2
@@ -110,7 +116,21 @@ while IFS=$'\t' read -r rel branch origin || [[ -n ${rel:-} ]]; do
     continue
   fi
   mkdir -p "$(dirname "$dest")"
-  if git clone -- "$origin" "$dest"; then
+  ok_clone=0
+  if (( USE_GH )); then
+    if ! command -v gh >/dev/null 2>&1; then
+      echo "gh not installed — falling back to git clone" >&2
+      USE_GH=0
+    fi
+  fi
+  if (( USE_GH )); then
+    if gh repo clone "$origin" "$dest"; then
+      ok_clone=1
+    fi
+  elif git clone -- "$origin" "$dest"; then
+    ok_clone=1
+  fi
+  if (( ok_clone )); then
     if [[ -n $branch && $branch != HEAD ]]; then
       git -C "$dest" checkout "$branch" 2>/dev/null || \
         echo "note: branch $branch missing on remote, left at default" >&2
@@ -373,12 +393,11 @@ dev_restore() {
 
   local clone="$snap/dev/clone-dev.sh"
   if [[ -x $clone ]]; then
-    info "rebuilding $DEV_ROOT from GitHub remotes"
-    if (( DRY_RUN )); then
-      "$clone" --dry-run || true
-    else
-      "$clone" || warn "some clones failed (private remotes need gh/ssh auth)"
-    fi
+    local args=()
+    (( DRY_RUN )) && args+=(--dry-run)
+    (( WANT_GH )) && args+=(--gh)
+    info "rebuilding $DEV_ROOT from GitHub remotes${WANT_GH:+ (gh repo clone)}"
+    "$clone" "${args[@]}" || warn "some clones failed (private remotes need: gh auth login)"
   fi
 
   dev_restore_envs "$snap"

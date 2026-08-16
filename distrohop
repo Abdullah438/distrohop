@@ -2,7 +2,7 @@
 # distrohop — snapshot the configs that survive a distro hop, then put them back.
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 SOURCE=${BASH_SOURCE[0]}
 while [[ -L $SOURCE ]]; do
@@ -24,6 +24,7 @@ DRY_RUN=0
 WANT_SECRETS=0
 WANT_ARCHIVE=0
 WANT_UP=0
+WANT_GH=0
 DEST_OVERRIDE=""
 NAME_OVERRIDE=""
 GROUPS_OVERRIDE=""
@@ -54,7 +55,8 @@ ${C_BOLD}distrohop${C_RESET} ${C_DIM}v$VERSION${C_RESET} — backup the configs 
 ${C_BOLD}USAGE${C_RESET}
   distrohop backup  [--name NAME] [--dest DIR] [--groups LIST] [--secrets] [--archive]
   distrohop restore SNAPSHOT [--groups LIST] [--secrets] [--up] [--dry-run]
-  distrohop clone   [SNAPSHOT] [--dry-run]
+  distrohop clone   [SNAPSHOT] [--gh] [--dry-run]
+  distrohop s3      configure [ENVFILE] | push [SNAPSHOT] | pull NAME | ls
   distrohop list
   distrohop show    SNAPSHOT
   distrohop status  [--groups LIST]
@@ -81,7 +83,9 @@ ${C_BOLD}EXAMPLES${C_RESET}
   distrohop backup --name workstation
   distrohop backup --dest /run/media/$USER/USB --archive --secrets
   distrohop restore workstation --up
-  distrohop clone workstation
+  distrohop clone workstation --gh
+  distrohop s3 push workstation
+  distrohop s3 pull workstation
   distrohop packages apply --portable
   distrohop bootstrap
 
@@ -143,6 +147,10 @@ group_wanted() {
 # shellcheck source=lib/dev.sh
 if [[ -f $SCRIPT_DIR/lib/dev.sh ]]; then
   source "$SCRIPT_DIR/lib/dev.sh"
+fi
+# shellcheck source=lib/s3.sh
+if [[ -f $SCRIPT_DIR/lib/s3.sh ]]; then
+  source "$SCRIPT_DIR/lib/s3.sh"
 fi
 
 # ---------------------------------------------------------------------------
@@ -606,12 +614,11 @@ cmd_clone() {
     [[ -n $snap ]] || die "no snapshot found — pass one: distrohop clone workstation"
   fi
   [[ -x $snap/dev/clone-dev.sh ]] || die "no clone map in $snap (backup with the dev group)"
-  info "rebuilding $DEV_ROOT from $(basename "$snap")"
-  if (( DRY_RUN )); then
-    "$snap/dev/clone-dev.sh" --dry-run
-  else
-    "$snap/dev/clone-dev.sh"
-  fi
+  local args=()
+  (( DRY_RUN )) && args+=(--dry-run)
+  (( WANT_GH )) && args+=(--gh)
+  info "rebuilding $DEV_ROOT from $(basename "$snap")${WANT_GH:+ (gh repo clone)}"
+  "$snap/dev/clone-dev.sh" "${args[@]}"
 }
 
 cmd_packages_dump() {
@@ -768,6 +775,7 @@ while [[ $# -gt 0 ]]; do
     --secrets) WANT_SECRETS=1; shift ;;
     --archive) WANT_ARCHIVE=1; shift ;;
     --up) WANT_UP=1; shift ;;
+    --gh) WANT_GH=1; shift ;;
     --portable) PORTABLE=1; shift ;;
     --name) NAME_OVERRIDE=${2:?}; shift 2 ;;
     --dest) DEST_OVERRIDE=${2:?}; shift 2 ;;
@@ -810,5 +818,6 @@ case $cmd in
     ;;
   bootstrap) cmd_bootstrap ;;
   dconf) cmd_dconf "${1:-}" "${2:-}" ;;
+  s3) cmd_s3 "$@" ;;
   *) die "unknown command: $cmd  (try: distrohop help)" ;;
 esac

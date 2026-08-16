@@ -1,0 +1,12 @@
+# Copy to ~/.config/distrohop/s3.conf (chmod 600) or run:
+#   distrohop s3 configure
+# which imports R2_* from ~/Dev/Fullstack/khata/.env
+#
+# Same S3 API works for Cloudflare R2, AWS, MinIO, etc.
+
+endpoint=https://<ACCOUNT_ID>.r2.cloudflarestorage.com
+bucket=distrohop
+prefix=
+access_key=
+secret_key=
+region=auto

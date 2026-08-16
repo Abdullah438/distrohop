@@ -1,3 +1,4 @@
+s3.conf
 # Snapshot payloads that do not belong on a public remote.
 snapshots/**/dev/envs/
 snapshots/**/dev/volumes/
