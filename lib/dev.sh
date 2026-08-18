@@ -24,12 +24,14 @@ dev_repos() {
 
 dev_env_files() {
   [[ -d $DEV_ROOT ]] || return 0
+  # find exits 1 on unreadable (container-owned) dirs — never propagate that
   find "$DEV_ROOT" -type f \
-    \( -name '.env' -o -name '.env.*' -o -name '.npmrc' -o -name '.envrc' \) \
+    \( -name '.env' -o -name '.env.*' -o -name '*.env' -o -name '.npmrc' -o -name '.envrc' \) \
     ! -name '.env.example' ! -name '*.example' ! -name '.example.env' \
+    ! -name '*.pre-hop.*' \
     ! -path '*/node_modules/*' ! -path '*/.git/*' ! -path '*/.venv/*' \
     ! -path '*/supabase/.temp/*' ! -path '*/.temp/*' \
-    -print 2>/dev/null | sort
+    -print 2>/dev/null | sort || true
 }
 
 dev_bind_paths() {
@@ -48,6 +50,7 @@ dev_bind_paths() {
   do
     [[ -d $HOME/$p ]] && printf '%s\n' "$p"
   done
+  return 0
 }
 
 dev_named_volumes() {
@@ -226,11 +229,98 @@ dev_tar_image() {
   fi
 }
 
+# Logical dump per postgres volume — must run while containers are still up.
+dev_backup_pg_dumps() {
+  local out=$1
+  command -v docker >/dev/null 2>&1 || return 0
+  docker info >/dev/null 2>&1 || return 0
+  local name cid user
+  while IFS= read -r name; do
+    [[ -z $name ]] && continue
+    cid=$(docker ps -q --filter "volume=$name" | head -n1 || true)
+    [[ -n $cid ]] || continue
+    if docker exec "$cid" sh -c 'command -v pg_dumpall' >/dev/null 2>&1; then
+      user=$(docker exec "$cid" printenv POSTGRES_USER 2>/dev/null || echo postgres)
+      info "pg_dumpall $name"
+      (( DRY_RUN )) && continue
+      docker exec "$cid" pg_dumpall -U "$user" > "$out/volumes/${name}.sql" 2>/dev/null \
+        || warn "pg_dumpall failed for $name (volume tar is enough)"
+    fi
+  done < <(dev_named_volumes)
+}
+
+# Running containers that mount a named volume we back up, or bind-mount
+# into one of the [dev] data dirs. Printed one id per line.
+dev_containers_to_stop() {
+  command -v docker >/dev/null 2>&1 || return 0
+  docker info >/dev/null 2>&1 || return 0
+
+  local vols binds
+  vols=$(dev_named_volumes)
+  binds=$(dev_bind_paths | sort -u | while read -r rel; do
+    [[ -n $rel && -d $HOME/$rel ]] && printf '%s\n' "$HOME/$rel"
+  done)
+
+  local cid mtype mname msrc root hit
+  while IFS= read -r cid; do
+    [[ -z $cid ]] && continue
+    hit=0
+    while IFS='|' read -r mtype mname msrc; do
+      [[ -z $mtype ]] && continue
+      if [[ $mtype == volume && -n $mname ]]; then
+        if printf '%s\n' "$vols" | grep -qxF "$mname"; then hit=1; break; fi
+      elif [[ $mtype == bind && -n $msrc ]]; then
+        while IFS= read -r root; do
+          [[ -z $root ]] && continue
+          if [[ $msrc == "$root" || $msrc == "$root"/* ]]; then hit=1; break 2; fi
+        done <<< "$binds"
+      fi
+    done < <(docker inspect "$cid" --format '{{range .Mounts}}{{.Type}}|{{.Name}}|{{.Source}}{{"\n"}}{{end}}' 2>/dev/null)
+    (( hit )) && printf '%s\n' "$cid"
+  done < <(docker ps -q 2>/dev/null)
+}
+
+# Stop containers so volume/bind copies are consistent and nothing holds
+# files open. Prints the ids that were actually stopped (info → stderr).
+dev_stop_containers() {
+  local cid cname
+  while IFS= read -r cid; do
+    [[ -z $cid ]] && continue
+    cname=$(docker inspect "$cid" --format '{{.Name}}' 2>/dev/null || true)
+    cname=${cname#/}
+    if docker stop "$cid" >/dev/null 2>&1; then
+      info "stopped container ${cname:-$cid}" >&2
+      printf '%s\n' "$cid"
+    else
+      warn "could not stop ${cname:-$cid} — copying it live" >&2
+    fi
+  done < <(dev_containers_to_stop)
+}
+
+# Restart in reverse order so dependencies (db) come up before apps.
+dev_start_containers() {
+  local -a ids=("$@")
+  local i cid cname
+  for (( i=${#ids[@]}-1; i>=0; i-- )); do
+    cid=${ids[i]}
+    [[ -z $cid ]] && continue
+    cname=$(docker inspect "$cid" --format '{{.Name}}' 2>/dev/null || true)
+    cname=${cname#/}
+    if docker start "$cid" >/dev/null 2>&1; then
+      info "started container ${cname:-$cid}"
+    else
+      warn "failed to restart ${cname:-$cid} — start it by hand"
+    fi
+  done
+}
+
 dev_backup_volumes() {
   local out=$1
   mkdir -p "$out/volumes"
-  command -v docker >/dev/null 2>&1 || { printf '0\n'; return 0; }
-  docker info >/dev/null 2>&1 || { warn "docker not running — skipped volumes"; printf '0\n'; return 0; }
+  if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+    warn "docker unavailable — skipped volumes"
+    return 0
+  fi
 
   local img name dest n=0
   img=$(dev_tar_image)
@@ -247,16 +337,6 @@ dev_backup_volumes() {
         -v "$out/volumes":/to \
         "$img" tar -C /from -czf "/to/${name}.tar.gz" . \
         || { warn "volume tar failed: $name"; continue; }
-      # logical dump when the volume is attached to postgres
-      local cid user
-      cid=$(docker ps -q --filter "volume=$name" | head -n1 || true)
-      if [[ -n $cid ]]; then
-        if docker exec "$cid" sh -c 'command -v pg_dumpall' >/dev/null 2>&1; then
-          user=$(docker exec "$cid" printenv POSTGRES_USER 2>/dev/null || echo postgres)
-          docker exec "$cid" pg_dumpall -U "$user" > "$out/volumes/${name}.sql" 2>/dev/null \
-            || warn "pg_dumpall failed for $name (volume tar is enough)"
-        fi
-      fi
     fi
     printf '%s\n' "$name" >> "$out/volumes/NAMES.txt"
     n=$((n + 1))
@@ -293,12 +373,27 @@ dev_status() {
 dev_backup() {
   local snap=$1
   local out="$snap/dev"
-  mkdir -p "$out"
+  mkdir -p "$out" "$out/volumes"
 
   dev_write_inventory "$out"
   dev_backup_envs "$out"
-  dev_backup_bind "$out"
-  dev_backup_volumes "$out"
+  dev_backup_pg_dumps "$out"
+
+  # Stop containers that touch the volumes / data dirs so the copies below
+  # are consistent and nothing is held open mid-read. Restarted right after.
+  local -a stopped=()
+  if (( ! DRY_RUN )); then
+    mapfile -t stopped < <(dev_stop_containers)
+    ((${#stopped[@]})) && info "containers paused for the copy: ${#stopped[@]}"
+  fi
+
+  dev_backup_bind "$out" || warn "bind backup had errors"
+  dev_backup_volumes "$out" || warn "volume backup had errors"
+
+  if ((${#stopped[@]})); then
+    dev_start_containers "${stopped[@]}"
+  fi
+
   dev_backup_pm2 "$out"
 
   cat > "$out/.gitignore" <<'EOF'
@@ -392,17 +487,17 @@ dev_restore() {
   [[ -d $snap/dev ]] || return 0
 
   local clone="$snap/dev/clone-dev.sh"
-  if [[ -x $clone ]]; then
+  if restore_wanted clone && [[ -x $clone ]]; then
     local args=()
     (( DRY_RUN )) && args+=(--dry-run)
     (( WANT_GH )) && args+=(--gh)
-    info "rebuilding $DEV_ROOT from GitHub remotes${WANT_GH:+ (gh repo clone)}"
+    info "rebuilding $DEV_ROOT from GitHub remotes$( (( WANT_GH )) && printf ' (gh repo clone)' )"
     "$clone" "${args[@]}" || warn "some clones failed (private remotes need: gh auth login)"
   fi
 
-  dev_restore_envs "$snap"
-  dev_restore_bind "$snap"
-  dev_restore_volumes "$snap"
+  restore_wanted envs && dev_restore_envs "$snap"
+  restore_wanted bind && dev_restore_bind "$snap"
+  restore_wanted volumes && dev_restore_volumes "$snap"
 
   if (( WANT_UP )) && (( ! DRY_RUN )); then
     dev_compose_up "$snap"

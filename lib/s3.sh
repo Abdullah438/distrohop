@@ -76,7 +76,8 @@ s3_ensure() {
 # rclone S3 remote path is remote:BUCKET/key
 s3_remote_path() {
   local name=$1
-  local pfx=${prefix:-distrohop}
+  # Empty prefix is intentional: objects live at bucket/<snapshot>, not bucket/distrohop/<snapshot>.
+  local pfx=${prefix-}
   pfx=${pfx#/}; pfx=${pfx%/}
   local b=${bucket:?s3 bucket not set}
   if [[ -n $name && -n $pfx ]]; then
@@ -137,7 +138,7 @@ cmd_s3_configure() {
     return 0
   fi
   s3_load_conf || die "config incomplete"
-  ok "wrote $S3_CONF  (bucket=$bucket prefix=${prefix:-distrohop})"
+  ok "wrote $S3_CONF  (bucket=$bucket prefix=${prefix:-<none>})"
   info "objects land at r2:$(s3_remote_path '<name>')"
 }
 
@@ -180,12 +181,23 @@ cmd_s3_pull() {
   s3_rclone_env
   local dest="${DEST_OVERRIDE:-$DATA_DIR}/$name"
   mkdir -p "$(dirname "$dest")"
-  info "s3 pull  $(s3_remote_path "$name")  →  $dest"
+  local src
+  src=$(s3_remote_path "$name")
+  if [[ -z ${prefix-} ]]; then
+    if ! rclone lsf "r2:${src}" --max-depth 1 2>/dev/null | grep -q .; then
+      local old="${bucket}/distrohop/${name}"
+      if rclone lsf "r2:${old}" --max-depth 1 2>/dev/null | grep -q .; then
+        warn "using legacy key ${old} (older pushes nested a distrohop/ prefix)"
+        src=$old
+      fi
+    fi
+  fi
+  info "s3 pull  ${src}  →  $dest"
   if (( DRY_RUN )); then
-    rclone copy "r2:$(s3_remote_path "$name")" "$dest" --dry-run -P
+    rclone copy "r2:${src}" "$dest" --dry-run -P
     return 0
   fi
-  rclone copy "r2:$(s3_remote_path "$name")" "$dest" -P --s3-no-check-bucket
+  rclone copy "r2:${src}" "$dest" -P --s3-no-check-bucket
   ok "pulled $dest"
 }
 

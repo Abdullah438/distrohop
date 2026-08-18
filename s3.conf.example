@@ -6,6 +6,7 @@
 
 endpoint=https://<ACCOUNT_ID>.r2.cloudflarestorage.com
 bucket=distrohop
+# Leave empty so snapshots sit at bucket/<name>, not bucket/distrohop/<name>
 prefix=
 access_key=
 secret_key=

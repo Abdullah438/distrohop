@@ -20,28 +20,39 @@ distrohop backup --name workstation
 distrohop backup --name workstation --secrets --archive
 ```
 
+Default groups are `core apps gtk editor packages dev`. Secrets are opt-in (`--secrets`). Containers that touch the backed-up docker volumes or data dirs are stopped before the copy and started again right after, so the copies are consistent.
+
 `~/Dev` git trees are never copied. The snapshot records each GitHub remote and folder (`Fullstack/khata`, `Python/myed-backend`, …) plus a `clone-dev.sh` that rebuilds the tree.
 
 `.env` files and docker volumes *are* copied (they are not in git). They sit under `dev/envs` and `dev/volumes` and are gitignored so a public push of this app does not leak them.
+
+Backup also writes `packages/dev-apps.json` — Cursor, VS Code, Docker, nvm, pyenv, and similar tools that were on the machine, with enough detail to try an automated reinstall later.
 
 Copy `~/Backups/distrohop/` onto a USB, or commit the clone map (`dev/repos.tsv`, `dev/clone-dev.sh`) with this repo.
 
 ## Restore
 
+On a TTY, restore opens a checkbox list of what is in the snapshot. Tick what you want (secrets, package install, and development apps are optional). `--yes` skips the prompt and restores the defaults. `--groups` skips the prompt and restores only what you listed.
+
 ```bash
 distrohop install
-distrohop restore workstation               # configs + clone ~/Dev + envs/volumes
-distrohop clone workstation                 # only rebuild ~/Dev from GitHub
+distrohop restore workstation               # checkbox picker
+distrohop restore workstation --yes         # defaults, no prompt
 distrohop restore workstation --up          # then docker compose / supabase / pm2
+distrohop clone workstation                 # only rebuild ~/Dev from GitHub
 distrohop bootstrap                         # zsh, p10k, plugins, fonts (Arch)
 distrohop packages apply --portable
 ```
+
+If you tick **development apps**, distrohop tries the native package manager (**pacman/AUR**, **dnf**, or **apt**), then nvm / pyenv / npm. Arch names are mapped (e.g. `github-cli` → `gh`, `docker` → `docker.io` on Debian). Anything with no package (Cursor, Postman, Android Studio, …) is listed as a manual step.
 
 Private remotes: `distrohop clone workstation --gh` uses `gh repo clone` (needs `gh auth login`). Without `--gh` it is plain `git clone`.
 
 ## S3 / Cloudflare R2
 
 Uploads the **whole** snapshot, including `secrets/`, `.env` files, and docker volumes.
+
+Objects land at `bucket/<snapshot-name>` (for example `distrohop/workstation`). Leave `prefix=` empty in `s3.conf` — a non-empty prefix would nest an extra folder inside the bucket.
 
 Runtime credentials are **`~/.config/distrohop/s3.conf`** (not a `.env`, not in git, not inside the R2 snapshot). Keep a copy of that file somewhere else (1Password, USB) — it is the bootstrap. On a blank machine you need it first, then you can pull:
 
@@ -62,6 +73,8 @@ distrohop s3 push                         # take a full backup (with secrets) an
 distrohop s3 ls
 distrohop s3 pull workstation
 ```
+
+If an older push created a `distrohop/` folder inside the bucket, those objects are at `distrohop/distrohop/<name>`. Re-push after this fix, or copy them up one level in the R2 dashboard.
 
 Desktop settings (dconf) can be saved and reloaded with `distrohop dconf export` / `import` after the session is up.
 

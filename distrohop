@@ -2,7 +2,7 @@
 # distrohop — snapshot the configs that survive a distro hop, then put them back.
 set -euo pipefail
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 
 SOURCE=${BASH_SOURCE[0]}
 while [[ -L $SOURCE ]]; do
@@ -17,17 +17,20 @@ CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/distrohop"
 DATA_DIR="${DISTROHOP_DIR:-$HOME/Backups/distrohop}"
 MANIFEST="$CONFIG_DIR/manifest.conf"
 
-DEFAULT_GROUPS=(core apps gtk editor wallpapers packages dev)
-ALL_FILE_GROUPS=(core apps gtk editor wallpapers themes secrets kde extra)
+DEFAULT_GROUPS=(core apps gtk editor packages dev)
+ALL_FILE_GROUPS=(core apps gtk editor secrets extra)
 
 DRY_RUN=0
 WANT_SECRETS=0
 WANT_ARCHIVE=0
 WANT_UP=0
 WANT_GH=0
+WANT_YES=0
 DEST_OVERRIDE=""
 NAME_OVERRIDE=""
 GROUPS_OVERRIDE=""
+WITH_GROUPS=""
+PICKED=""
 
 if [[ -t 1 ]]; then
   C_RESET=$'\033[0m'
@@ -53,8 +56,8 @@ usage() {
 ${C_BOLD}distrohop${C_RESET} ${C_DIM}v$VERSION${C_RESET} — backup the configs that survive a distro hop
 
 ${C_BOLD}USAGE${C_RESET}
-  distrohop backup  [--name NAME] [--dest DIR] [--groups LIST] [--secrets] [--archive]
-  distrohop restore SNAPSHOT [--groups LIST] [--secrets] [--up] [--dry-run]
+  distrohop backup  [--name NAME] [--dest DIR] [--groups LIST] [--with LIST] [--secrets] [--archive]
+  distrohop restore SNAPSHOT [--groups LIST] [--with LIST] [--secrets] [--up] [--yes] [--dry-run]
   distrohop clone   [SNAPSHOT] [--gh] [--dry-run]
   distrohop s3      configure [ENVFILE] | push [SNAPSHOT] | pull NAME | ls
   distrohop list
@@ -71,17 +74,17 @@ ${C_BOLD}BACKUP GROUPS${C_RESET}  (default: ${DEFAULT_GROUPS[*]})
   apps         fastfetch, alacritty, btop, cava, micro, fontconfig, gh, systemd units
   gtk          gtk-3/4 settings
   editor       Cursor settings.json
-  wallpapers   ~/.local/share/wallpapers
   packages     pacman / AUR / flatpak lists (always dumped on backup)
   dev          ~/Dev clone map (GitHub remotes + folder tree), .env files, docker volumes
-  themes       icon / cursor themes  ${C_DIM}(large — opt-in)${C_RESET}
   secrets      ssh private keys, gh hosts, rclone.conf  ${C_DIM}(opt-in)${C_RESET}
-  kde          Plasma / Kwin / Konsole configs  ${C_DIM}(opt-in)${C_RESET}
   extra        whatever you add under [extra] in the manifest
 
 ${C_BOLD}EXAMPLES${C_RESET}
   distrohop backup --name workstation
+  distrohop backup --secrets
   distrohop backup --dest /run/media/$USER/USB --archive --secrets
+  distrohop restore workstation                 # checkbox picker
+  distrohop restore workstation --yes           # defaults, no prompt
   distrohop restore workstation --up
   distrohop clone workstation --gh
   distrohop s3 push workstation
@@ -129,6 +132,9 @@ parse_manifest() {
 active_groups() {
   local raw=${GROUPS_OVERRIDE:-${DEFAULT_GROUPS[*]}}
   raw=${raw//,/ }
+  if [[ -n ${WITH_GROUPS:-} ]]; then
+    raw+=" ${WITH_GROUPS//,/ }"
+  fi
   # --secrets implies the secrets group
   if (( WANT_SECRETS )); then
     [[ " $raw " == *" secrets "* ]] || raw+=" secrets"
@@ -144,6 +150,102 @@ group_wanted() {
   return 1
 }
 
+restore_wanted() {
+  local id=$1 x
+  for x in $PICKED; do
+    [[ $x == "$id" ]] && return 0
+  done
+  return 1
+}
+
+restore_default_on() {
+  local id=$1
+  case $id in
+    core|apps|gtk|editor|clone|envs|bind|volumes|files|dev-apps) return 0 ;;
+    secrets) (( WANT_SECRETS )) && return 0; group_wanted secrets && return 0; return 1 ;;
+    *) return 1 ;;
+  esac
+}
+
+restore_collect_items() {
+  local snap=$1
+  UI_IDS=()
+  UI_LABELS=()
+  UI_ON=()
+
+  add_restore_item() {
+    local id=$1 label=$2 on=0
+    restore_default_on "$id" && on=1
+    if [[ -n ${WITH_GROUPS:-} && " ${WITH_GROUPS//,/ } " == *" $id "* ]]; then
+      on=1
+    fi
+    UI_IDS+=("$id")
+    UI_LABELS+=("$label")
+    UI_ON+=("$on")
+  }
+
+  snapshot_has_group() {
+    local g=$1
+    [[ -f $snap/MANIFEST.txt ]] && grep -q $'^'"$g"$'\t' "$snap/MANIFEST.txt"
+  }
+
+  if [[ -f $snap/MANIFEST.txt ]]; then
+    snapshot_has_group core && add_restore_item core "zsh, p10k, bash, git, nano"
+    snapshot_has_group apps && add_restore_item apps "alacritty, btop, gh, fonts, systemd"
+    snapshot_has_group gtk && add_restore_item gtk "gtk-3/4 settings"
+    snapshot_has_group editor && add_restore_item editor "Cursor settings.json"
+    snapshot_has_group extra && add_restore_item extra "extra paths from the manifest"
+  elif [[ -d $snap/files ]]; then
+    add_restore_item files "all config files in the snapshot"
+  fi
+
+  if [[ -d $snap/secrets ]] && { snapshot_has_group secrets || [[ -n $(find "$snap/secrets" -mindepth 1 -print -quit 2>/dev/null) ]]; }; then
+    add_restore_item secrets "ssh keys, gh hosts, rclone.conf"
+  fi
+
+  [[ -x $snap/dev/clone-dev.sh ]] && add_restore_item clone "rebuild ~/Dev from GitHub remotes"
+  if [[ -d $snap/dev/envs ]] && [[ -n $(find "$snap/dev/envs" -type f -print -quit 2>/dev/null) ]]; then
+    add_restore_item envs "restore .env / .npmrc files"
+  fi
+  [[ -s $snap/dev/bind/PATHS.txt ]] && add_restore_item bind "restore compose data dirs"
+  [[ -s $snap/dev/volumes/NAMES.txt ]] && add_restore_item volumes "restore docker named volumes"
+  [[ -s $snap/packages/portable.txt ]] && add_restore_item packages "install portable pacman/AUR/flatpak lists"
+  [[ -f $snap/packages/dev-apps.json ]] && add_restore_item dev-apps "development apps (auto-install + manual notes)"
+}
+
+restore_pick_or_default() {
+  local snap=$1
+  if [[ -z $GROUPS_OVERRIDE ]] && (( ! WANT_YES )) && [[ -t 0 && -t 1 && -c /dev/tty ]]; then
+    restore_collect_items "$snap"
+    if ((${#UI_IDS[@]})); then
+      ui_checklist || die "restore cancelled"
+      PICKED=$UI_PICKED
+      return 0
+    fi
+  fi
+  local x sel=()
+  for x in $(active_groups); do
+    case $x in
+      packages)
+        if [[ -n $GROUPS_OVERRIDE || " ${WITH_GROUPS//,/ } " == *" packages "* ]]; then
+          sel+=(packages)
+        fi
+        ;;
+      dev) sel+=(clone envs bind volumes) ;;
+      *) sel+=("$x") ;;
+    esac
+  done
+  PICKED="${sel[*]}"
+}
+
+# shellcheck source=lib/ui.sh
+if [[ -f $SCRIPT_DIR/lib/ui.sh ]]; then
+  source "$SCRIPT_DIR/lib/ui.sh"
+fi
+# shellcheck source=lib/dev-apps.sh
+if [[ -f $SCRIPT_DIR/lib/dev-apps.sh ]]; then
+  source "$SCRIPT_DIR/lib/dev-apps.sh"
+fi
 # shellcheck source=lib/dev.sh
 if [[ -f $SCRIPT_DIR/lib/dev.sh ]]; then
   source "$SCRIPT_DIR/lib/dev.sh"
@@ -302,8 +404,11 @@ Notes
 - terminal-news: after restore,
     systemctl --user daemon-reload
     systemctl --user enable --now terminal-news.timer
-- The [kde] group is off by default. Pass --groups kde only if you want
-  those desktop configs on the next install.
+- Development apps (Cursor, Docker, nvm, …) are listed in packages/dev-apps.txt.
+  Tick dev-apps in the restore picker to try automated install; leftover
+  manual steps are printed at the end.
+
+Restore asks what to put back (checkboxes). Skip the prompt with --yes.
 
 ~/Dev
 -----
@@ -425,6 +530,9 @@ cmd_status() {
   if declare -F dev_status >/dev/null; then
     dev_status
   fi
+  if declare -F devapps_status >/dev/null; then
+    devapps_status
+  fi
 
   info "$count present, $missing missing"
   info "destination: ${DEST_OVERRIDE:-$DATA_DIR}"
@@ -455,6 +563,9 @@ cmd_backup() {
   mkdir -p "$dest/files"
   write_meta "$dest"
   dump_packages "$dest/packages"
+  if declare -F devapps_backup >/dev/null; then
+    devapps_backup "$dest"
+  fi
   write_notes "$dest"
 
   local g rel copied=0
@@ -554,31 +665,33 @@ cmd_restore() {
     warn "snapshot was taken from $orig_home — restoring into $HOME"
   fi
 
+  restore_pick_or_default "$snap"
+  GROUPS_OVERRIDE=$PICKED
+
   info "restore ← $snap"
-  info "groups:   $(active_groups | tr '\n' ' ')"
+  info "selected: ${PICKED:-none}"
   (( DRY_RUN )) && warn "dry-run — nothing will be written"
 
   local g rel restored=0
-  if [[ -f $snap/MANIFEST.txt ]]; then
-    while IFS=$'\t' read -r g rel; do
-      [[ -z ${rel:-} ]] && continue
-      [[ $g == secrets ]] && continue
-      group_wanted "$g" || continue
-      if restore_item "$rel" "$snap/files"; then
-        restored=$((restored + 1))
-      fi
-    done < "$snap/MANIFEST.txt"
-  else
-    # fallback: copy the whole files/ tree
+  if restore_wanted files && [[ -d $snap/files ]]; then
     if (( DRY_RUN )); then
       rsync -a -n "$snap/files/" "$HOME/"
     else
       rsync -a --backup --suffix=".pre-hop.$(date +%Y%m%d%H%M%S)" "$snap/files/" "$HOME/"
     fi
     restored=1
+  elif [[ -f $snap/MANIFEST.txt ]]; then
+    while IFS=$'\t' read -r g rel; do
+      [[ -z ${rel:-} ]] && continue
+      [[ $g == secrets ]] && continue
+      restore_wanted "$g" || continue
+      if restore_item "$rel" "$snap/files"; then
+        restored=$((restored + 1))
+      fi
+    done < "$snap/MANIFEST.txt"
   fi
 
-  if group_wanted secrets; then
+  if restore_wanted secrets; then
     if [[ -d $snap/secrets ]]; then
       while IFS=$'\t' read -r g rel; do
         [[ $g == secrets ]] || continue
@@ -589,8 +702,16 @@ cmd_restore() {
     fi
   fi
 
-  if group_wanted dev && declare -F dev_restore >/dev/null; then
+  if declare -F dev_restore >/dev/null; then
     dev_restore "$snap"
+  fi
+
+  if restore_wanted packages; then
+    cmd_packages_apply 1 "$snap"
+  fi
+
+  if restore_wanted dev-apps && declare -F devapps_restore >/dev/null; then
+    devapps_restore "$snap"
   fi
 
   if (( ! DRY_RUN )); then
@@ -617,7 +738,7 @@ cmd_clone() {
   local args=()
   (( DRY_RUN )) && args+=(--dry-run)
   (( WANT_GH )) && args+=(--gh)
-  info "rebuilding $DEV_ROOT from $(basename "$snap")${WANT_GH:+ (gh repo clone)}"
+  info "rebuilding $DEV_ROOT from $(basename "$snap")$( (( WANT_GH )) && printf ' (gh repo clone)' )"
   "$snap/dev/clone-dev.sh" "${args[@]}"
 }
 
@@ -776,10 +897,12 @@ while [[ $# -gt 0 ]]; do
     --archive) WANT_ARCHIVE=1; shift ;;
     --up) WANT_UP=1; shift ;;
     --gh) WANT_GH=1; shift ;;
+    --yes|-y) WANT_YES=1; shift ;;
     --portable) PORTABLE=1; shift ;;
     --name) NAME_OVERRIDE=${2:?}; shift 2 ;;
     --dest) DEST_OVERRIDE=${2:?}; shift 2 ;;
     --groups) GROUPS_OVERRIDE=${2:?}; shift 2 ;;
+    --with) WITH_GROUPS=${2:?}; shift 2 ;;
     --) shift; POSITIONAL+=("$@"); break ;;
     -*) die "unknown flag: $1" ;;
     *) POSITIONAL+=("$1"); shift ;;
