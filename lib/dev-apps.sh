@@ -243,41 +243,10 @@ devapps_status() {
   printf '  %s%s recorded on backup%s\n\n' "$C_DIM" "$n" "$C_RESET"
 }
 
-devapps_pm() {
-  if command -v pacman >/dev/null 2>&1; then
-    printf '%s\n' pacman
-  elif command -v dnf >/dev/null 2>&1; then
-    printf '%s\n' dnf
-  elif command -v apt-get >/dev/null 2>&1; then
-    printf '%s\n' apt
-  else
-    printf '%s\n' none
-  fi
-}
-
-# Arch snapshot name → candidates on this distro (first match in repos wins).
-devapps_map_pkg() {
-  local pm=$1 pkg=$2
-  case $pm:$pkg in
-    *:cursor-bin) ;;
-    *:postman-bin) ;;
-    *:android-studio) ;;
-    *:supabase-bin) ;;
-    pacman:*) printf '%s\n' "$pkg" ;;
-    apt:github-cli|dnf:github-cli) printf '%s\n' gh ;;
-    apt:docker) printf '%s\n' docker.io docker-ce docker ;;
-    dnf:docker) printf '%s\n' docker docker-ce moby-engine ;;
-    apt:docker-compose) printf '%s\n' docker-compose-plugin docker-compose-v2 docker-compose ;;
-    dnf:docker-compose) printf '%s\n' docker-compose docker-compose-plugin ;;
-    apt:docker-buildx) printf '%s\n' docker-buildx docker-buildx-plugin ;;
-    dnf:docker-buildx) printf '%s\n' docker-buildx docker-buildx-plugin ;;
-    apt:visual-studio-code-bin|dnf:visual-studio-code-bin) printf '%s\n' code ;;
-    apt:jdk-openjdk) printf '%s\n' default-jdk openjdk-21-jdk openjdk-17-jdk ;;
-    dnf:jdk-openjdk) printf '%s\n' java-21-openjdk-devel java-17-openjdk-devel java-latest-openjdk-devel ;;
-    apt:dbeaver|dnf:dbeaver) printf '%s\n' dbeaver dbeaver-ce ;;
-    *) printf '%s\n' "$pkg" ;;
-  esac
-}
+# pm_detect/pm_map_pkg live in lib/pm.sh (shared with the main script); keep
+# these names as thin aliases so the rest of this file doesn't need renaming.
+devapps_pm() { pm_detect; }
+devapps_map_pkg() { pm_map_pkg "$@"; }
 
 devapps_provides_cmd() {
   case $1 in
@@ -300,25 +269,8 @@ devapps_provides_cmd() {
   esac
 }
 
-devapps_pkg_installed_pm() {
-  local pm=$1 p=$2
-  case $pm in
-    pacman) pacman -Q "$p" >/dev/null 2>&1 ;;
-    dnf) rpm -q "$p" >/dev/null 2>&1 ;;
-    apt) dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q 'install ok installed' ;;
-    *) return 1 ;;
-  esac
-}
-
-devapps_pkg_available() {
-  local pm=$1 p=$2
-  case $pm in
-    pacman) pacman -Si "$p" >/dev/null 2>&1 ;;
-    dnf) dnf list --available "$p" >/dev/null 2>&1 ;;
-    apt) apt-cache show "$p" >/dev/null 2>&1 ;;
-    *) return 1 ;;
-  esac
-}
+devapps_pkg_installed_pm() { pm_pkg_installed "$@"; }
+devapps_pkg_available() { pm_pkg_available "$@"; }
 
 devapps_pkg_manual_hint() {
   case $1 in
@@ -337,7 +289,7 @@ devapps_try_packages() {
   local pm
   pm=$(devapps_pm)
   if [[ $pm == none ]]; then
-    warn "no pacman, dnf, or apt — cannot auto-install packages"
+    warn "no pacman, dnf, apt, or zypper — cannot auto-install packages"
     local p
     for p in "${pkgs[@]}"; do
       FAILED_PKGS+=("$p")
@@ -385,26 +337,11 @@ devapps_try_packages() {
     info "$pm: ${repo[*]}"
     if (( DRY_RUN )); then
       INSTALLED_PKGS+=("${repo[@]}")
+    elif pm_install_batch "$pm" "${repo[@]}"; then
+      INSTALLED_PKGS+=("${repo[@]}")
     else
-      local ok_install=0
-      case $pm in
-        pacman)
-          sudo pacman -S --needed -- "${repo[@]}" && ok_install=1
-          ;;
-        dnf)
-          sudo dnf install -y "${repo[@]}" && ok_install=1
-          ;;
-        apt)
-          sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "${repo[@]}" && ok_install=1
-          ;;
-      esac
-      if (( ok_install )); then
-        INSTALLED_PKGS+=("${repo[@]}")
-      else
-        warn "$pm failed for: ${repo[*]}"
-        FAILED_PKGS+=("${repo[@]}")
-      fi
+      warn "$pm failed for: ${repo[*]}"
+      FAILED_PKGS+=("${repo[@]}")
     fi
   fi
 
@@ -506,10 +443,11 @@ PY
     [[ -n $note ]] && MANUAL_NOTES+=("$note")
   done <<< "$extra_notes"
 
-  local nvm_ver nvm_default nvm_nodes
+  local nvm_ver nvm_default nvm_nodes py_vers
   nvm_ver=$(python3 -c "import json,sys; n=json.load(open(sys.argv[1])).get('nvm') or {}; print(n.get('version') or '')" "$file")
   nvm_default=$(python3 -c "import json,sys; n=json.load(open(sys.argv[1])).get('nvm') or {}; print(n.get('default') or '')" "$file")
   nvm_nodes=$(python3 -c "import json,sys; n=json.load(open(sys.argv[1])).get('nvm') or {}; print(' '.join(n.get('installed') or []))" "$file")
+  py_vers=$(python3 -c "import json,sys; p=json.load(open(sys.argv[1])).get('pyenv') or {}; print(' '.join(p.get('installed') or []))" "$file")
 
   if [[ -n $nvm_ver || -n $nvm_nodes ]]; then
     if devapps_install_nvm "${nvm_ver:-0.40.6}"; then

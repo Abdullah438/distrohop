@@ -16,9 +16,11 @@ unset _dir SOURCE
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/distrohop"
 DATA_DIR="${DISTROHOP_DIR:-$HOME/Backups/distrohop}"
 MANIFEST="$CONFIG_DIR/manifest.conf"
+SETTINGS_CONF="${SETTINGS_CONF:-$CONFIG_DIR/settings.conf}"
 
 DEFAULT_GROUPS=(core apps gtk editor packages dev)
 ALL_FILE_GROUPS=(core apps gtk editor secrets extra)
+PRUNE_DEFAULT_KEEP=10
 
 DRY_RUN=0
 WANT_SECRETS=0
@@ -26,11 +28,14 @@ WANT_ARCHIVE=0
 WANT_UP=0
 WANT_GH=0
 WANT_YES=0
+WANT_NO_VERIFY=0
 DEST_OVERRIDE=""
 NAME_OVERRIDE=""
 GROUPS_OVERRIDE=""
 WITH_GROUPS=""
 PICKED=""
+KEEP_N=""
+OLDER_THAN=""
 
 if [[ -t 1 ]]; then
   C_RESET=$'\033[0m'
@@ -59,13 +64,16 @@ ${C_BOLD}USAGE${C_RESET}
   distrohop backup  [--name NAME] [--dest DIR] [--groups LIST] [--with LIST] [--secrets] [--archive]
   distrohop restore SNAPSHOT [--groups LIST] [--with LIST] [--secrets] [--up] [--yes] [--dry-run]
   distrohop clone   [SNAPSHOT] [--gh] [--dry-run]
-  distrohop s3      configure [ENVFILE] | push [SNAPSHOT] | pull NAME | ls
+  distrohop prune   [--keep N] [--dry-run]
+  distrohop clean   [--older-than DAYS] [--dry-run]
+  distrohop s3      configure ENVFILE | push [SNAPSHOT] [--no-verify] | pull NAME [--no-verify] | ls | prune [--keep N]
   distrohop list
   distrohop show    SNAPSHOT
   distrohop status  [--groups LIST]
   distrohop packages dump | apply [--portable] [--dry-run]
   distrohop bootstrap [--dry-run]
   distrohop dconf   export | import [FILE]
+  distrohop config  get|set KEY [VALUE]
   distrohop edit
   distrohop install
 
@@ -74,10 +82,13 @@ ${C_BOLD}BACKUP GROUPS${C_RESET}  (default: ${DEFAULT_GROUPS[*]})
   apps         fastfetch, alacritty, btop, cava, micro, fontconfig, gh, systemd units
   gtk          gtk-3/4 settings
   editor       Cursor settings.json
-  packages     pacman / AUR / flatpak lists (always dumped on backup)
+  packages     pacman/dnf/apt/zypper + AUR + flatpak lists (always dumped on backup)
   dev          ~/Dev clone map (GitHub remotes + folder tree), .env files, docker volumes
   secrets      ssh private keys, gh hosts, rclone.conf  ${C_DIM}(opt-in)${C_RESET}
   extra        whatever you add under [extra] in the manifest
+
+${C_BOLD}SETTINGS${C_RESET}  (distrohop config get|set KEY VALUE)
+  dev_root     where your dev tree lives (default: ~/Dev, or \$DISTROHOP_DEV for a one-off override)
 
 ${C_BOLD}EXAMPLES${C_RESET}
   distrohop backup --name workstation
@@ -87,10 +98,14 @@ ${C_BOLD}EXAMPLES${C_RESET}
   distrohop restore workstation --yes           # defaults, no prompt
   distrohop restore workstation --up
   distrohop clone workstation --gh
+  distrohop prune --keep 5
+  distrohop clean --older-than 30
   distrohop s3 push workstation
   distrohop s3 pull workstation
+  distrohop s3 prune --keep 5
   distrohop packages apply --portable
   distrohop bootstrap
+  distrohop config set dev_root ~/Projects
 
 Snapshots land in ${C_CYN}$DATA_DIR${C_RESET}
 Edit what gets copied: ${C_CYN}distrohop edit${C_RESET}
@@ -209,7 +224,7 @@ restore_collect_items() {
   fi
   [[ -s $snap/dev/bind/PATHS.txt ]] && add_restore_item bind "restore compose data dirs"
   [[ -s $snap/dev/volumes/NAMES.txt ]] && add_restore_item volumes "restore docker named volumes"
-  [[ -s $snap/packages/portable.txt ]] && add_restore_item packages "install portable pacman/AUR/flatpak lists"
+  [[ -s $snap/packages/portable.txt ]] && add_restore_item packages "install portable packages (pacman/dnf/apt/zypper + AUR + flatpak)"
   [[ -f $snap/packages/dev-apps.json ]] && add_restore_item dev-apps "development apps (auto-install + manual notes)"
 }
 
@@ -238,9 +253,21 @@ restore_pick_or_default() {
   PICKED="${sel[*]}"
 }
 
+# shellcheck source=lib/conf.sh
+if [[ -f $SCRIPT_DIR/lib/conf.sh ]]; then
+  source "$SCRIPT_DIR/lib/conf.sh"
+fi
+
+dev_root=""
+conf_load_kv "$SETTINGS_CONF" dev_root 2>/dev/null || true
+
 # shellcheck source=lib/ui.sh
 if [[ -f $SCRIPT_DIR/lib/ui.sh ]]; then
   source "$SCRIPT_DIR/lib/ui.sh"
+fi
+# shellcheck source=lib/pm.sh
+if [[ -f $SCRIPT_DIR/lib/pm.sh ]]; then
+  source "$SCRIPT_DIR/lib/pm.sh"
 fi
 # shellcheck source=lib/dev-apps.sh
 if [[ -f $SCRIPT_DIR/lib/dev-apps.sh ]]; then
@@ -326,22 +353,55 @@ restore_item() {
 # Packages
 # ---------------------------------------------------------------------------
 
+# Bundled desktop-session classifier: KDE package names on Arch/pacman only.
+# Only ever applied when the *live* session is actually detected as KDE (see
+# is_kde_live below) — on every other DE/distro combination this is a no-op
+# and packages fall through to the generic [packages_exclude] manifest layer.
 KDE_SESSION_RE='^(bluedevil|breeze(-.*)?|cachyos-.*kde.*|cachyos-kde-settings|kde-gtk-config|kdeplasma-addons|kscreen|kwallet.*|kwin.*|oxygen(-.*)?|phonon-.*|plasma-.*|plymouth-kcm|powerdevil)$'
 KDE_APPS_RE='^(ark|dolphin|ffmpegthumbs|filelight|gwenview|haruna|kate|kcalc|kdeconnect|kdegraphics-thumbnailers|kdialog|kinfocenter|kio-admin|konsole|partitionmanager|spectacle)$'
 
 is_kde_session() { [[ $1 =~ $KDE_SESSION_RE ]]; }
 is_kde_app()     { [[ $1 =~ $KDE_APPS_RE ]]; }
 
-dump_packages() {
-  local out=$1
-  mkdir -p "$out"
+is_kde_live() {
+  local de="${XDG_CURRENT_DESKTOP:-}${DESKTOP_SESSION:-}"
+  [[ ${de,,} == *kde* || ${de,,} == *plasma* ]]
+}
 
-  if command -v pacman >/dev/null 2>&1; then
-    pacman -Qqe > "$out/explicit.txt"
-    pacman -Qqm > "$out/aur.txt" 2>/dev/null || : > "$out/aur.txt"
-    : > "$out/portable.txt"
-    : > "$out/kde-session.txt"
-    : > "$out/kde-apps.txt"
+# Filters $1 (a package list, one name per line) in place against glob
+# patterns from the manifest's [packages_exclude] section — the DE/distro
+# generic escape hatch for "don't reinstall these portably".
+apply_packages_excludes() {
+  local list=$1
+  [[ -f $MANIFEST ]] || return 0
+  local -a patterns=()
+  local pat
+  while IFS= read -r pat; do
+    [[ -n $pat ]] && patterns+=("$pat")
+  done < <(parse_manifest packages_exclude)
+  ((${#patterns[@]})) || return 0
+
+  local tmp="$list.tmp" pkg keep p
+  : > "$tmp"
+  while IFS= read -r pkg; do
+    [[ -z $pkg ]] && continue
+    keep=1
+    for p in "${patterns[@]}"; do
+      # shellcheck disable=SC2053
+      [[ $pkg == $p ]] && { keep=0; break; }
+    done
+    (( keep )) && printf '%s\n' "$pkg" >> "$tmp"
+  done < "$list"
+  mv "$tmp" "$list"
+}
+
+# Splits packages/explicit.txt into portable.txt (+ kde-session.txt /
+# kde-apps.txt when the live session is actually KDE on pacman), then
+# applies the generic exclude list on top.
+classify_packages() {
+  local out=$1 pm=$2
+  if [[ $pm == pacman ]] && is_kde_live; then
+    : > "$out/portable.txt"; : > "$out/kde-session.txt"; : > "$out/kde-apps.txt"
     local pkg
     while IFS= read -r pkg; do
       [[ -z $pkg ]] && continue
@@ -354,15 +414,37 @@ dump_packages() {
       fi
     done < "$out/explicit.txt"
   else
-    warn "pacman not found — skipped Arch package lists"
+    cp "$out/explicit.txt" "$out/portable.txt" 2>/dev/null || : > "$out/portable.txt"
   fi
+  apply_packages_excludes "$out/portable.txt"
+}
+
+dump_packages() {
+  local out=$1 pm
+  mkdir -p "$out"
+  pm=$(pm_detect)
+  printf '%s\n' "$pm" > "$out/pm.txt"
+
+  if [[ $pm != none ]]; then
+    pm_explicit_packages "$pm" > "$out/explicit.txt" 2>/dev/null || : > "$out/explicit.txt"
+  else
+    : > "$out/explicit.txt"
+    warn "no supported package manager (pacman/dnf/apt/zypper) — explicit.txt left empty"
+  fi
+
+  if [[ $pm == pacman ]]; then
+    pacman -Qqm > "$out/aur.txt" 2>/dev/null || : > "$out/aur.txt"
+  else
+    : > "$out/aur.txt"
+  fi
+
+  classify_packages "$out" "$pm"
 
   if command -v flatpak >/dev/null 2>&1; then
     flatpak list --app --columns=application > "$out/flatpak.txt" 2>/dev/null || : > "$out/flatpak.txt"
   else
     : > "$out/flatpak.txt"
   fi
-
 }
 
 write_notes() {
@@ -371,6 +453,11 @@ write_notes() {
   host=$(hostname 2>/dev/null || echo unknown)
   os=$(grep -E '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d= -f2- | tr -d '"')
   de=${XDG_CURRENT_DESKTOP:-unknown}
+
+  local dev_examples=""
+  if declare -F dev_repos >/dev/null; then
+    dev_examples=$(dev_repos | cut -f1 | head -5 | paste -sd, -)
+  fi
 
   cat > "$snap/NOTES.txt" <<EOF
 distrohop snapshot
@@ -396,9 +483,11 @@ Restore on the new machine
 
 Notes
 -----
-- zshrc sources system paths (/usr/share/oh-my-zsh, p10k, zsh plugins).
-  bootstrap installs those on Arch. Other distros need the equivalents
-  or a user-local oh-my-zsh.
+- zshrc sources system paths (/usr/share/oh-my-zsh, p10k, zsh plugins) on
+  Arch, where bootstrap installs them as system packages. On dnf/apt/zypper,
+  bootstrap instead git-clones oh-my-zsh/p10k/plugins into
+  ~/.local/share/distrohop/zsh-plugins — .zshrc may need updating to source
+  from there instead.
 - git commit signing uses ~/.ssh/id_ed25519_gitsign — restore with --secrets
   or copy that key by hand.
 - terminal-news: after restore,
@@ -418,9 +507,9 @@ On the new machine:
     distrohop clone $snap
     # or:  $snap/dev/clone-dev.sh
 
-That recreates ~/Dev/Fullstack/khata, ~/Dev/Python/myed-backend, etc. and
-clones each GitHub remote into place. Private parami-ai remotes need
-gh auth or SSH keys (--secrets).
+That recreates the repos this snapshot mapped under $DEV_ROOT${dev_examples:+ (e.g. $dev_examples, …)} and
+clones each GitHub remote into place. Private remotes need gh auth (--gh)
+or SSH keys (--secrets).
 
 .env files, compose bind-mounts, and named docker volumes live under
 dev/envs, dev/bind, dev/volumes. They are gitignored on purpose — keep
@@ -446,6 +535,94 @@ write_meta() {
   printf '%s\n' "$HOME" > "$snap/meta/home"
   printf '%s\n' "$VERSION" > "$snap/meta/distrohop-version"
   active_groups > "$snap/meta/groups"
+}
+
+# ---------------------------------------------------------------------------
+# Cleanup of *.pre-hop.* leftovers from past restores
+# ---------------------------------------------------------------------------
+
+# HOME-relative roots distrohop could have written a *.pre-hop.* backup
+# under: every manifest path across all file groups, plus $DEV_ROOT.
+clean_scan_roots() {
+  local g rel
+  for g in "${ALL_FILE_GROUPS[@]}"; do
+    while IFS= read -r rel; do
+      [[ -n $rel ]] && printf '%s\n' "$rel"
+    done < <(parse_manifest "$g")
+  done
+  if [[ -n ${DEV_ROOT:-} && -d $DEV_ROOT ]]; then
+    rel=${DEV_ROOT#"$HOME"/}
+    [[ $rel != "$DEV_ROOT" ]] && printf '%s\n' "$rel"
+  fi
+}
+
+cmd_clean() {
+  ensure_manifest
+  if [[ -n $OLDER_THAN ]]; then
+    [[ $OLDER_THAN =~ ^[0-9]+$ ]] || die "--older-than must be a non-negative integer (days)"
+  fi
+  # find's -mtime +N matches "more than N days old", not ">= N days old" —
+  # subtract 1 so --older-than N means "N days old or older". --older-than 0
+  # (or no --older-than, for the preview) means "any age", so no filter.
+  local -a mtime_args=()
+  if [[ -n $OLDER_THAN && $OLDER_THAN -gt 0 ]]; then
+    mtime_args=(-mtime "+$((OLDER_THAN - 1))")
+  fi
+
+  local -a found=()
+  local rel root f
+  while IFS= read -r rel; do
+    root="$HOME/$rel"
+    while IFS= read -r -d '' f; do
+      found+=("$f")
+    done < <(find "$(dirname "$root")" -maxdepth 1 -name "$(basename "$root").pre-hop.*" \
+      "${mtime_args[@]}" -print0 2>/dev/null)
+    if [[ -d $root ]]; then
+      while IFS= read -r -d '' f; do
+        found+=("$f")
+      done < <(find "$root" -depth -name '*.pre-hop.*' \
+        "${mtime_args[@]}" -print0 2>/dev/null)
+    fi
+  done < <(clean_scan_roots)
+
+  # dedupe
+  local -A seen=()
+  local -a uniq=()
+  for f in "${found[@]}"; do
+    [[ -n ${seen[$f]:-} ]] && continue
+    seen[$f]=1
+    uniq+=("$f")
+  done
+
+  if ((${#uniq[@]} == 0)); then
+    ok "no *.pre-hop.* leftovers found"
+    return 0
+  fi
+
+  if [[ -z $OLDER_THAN ]]; then
+    printf '%s%d *.pre-hop.* leftover(s)%s\n' "$C_BOLD" "${#uniq[@]}" "$C_RESET"
+    for f in "${uniq[@]}"; do
+      printf '  %-60s %s\n' "$f" "$(du -sh "$f" 2>/dev/null | awk '{print $1}')"
+    done
+    printf '  %stotal: %s%s\n' "$C_DIM" "$(du -shc "${uniq[@]}" 2>/dev/null | tail -1 | awk '{print $1}')" "$C_RESET"
+    info "nothing deleted — re-run with --older-than N (or --older-than 0 to remove all of the above)"
+    return 0
+  fi
+
+  local reclaimed
+  reclaimed=$(du -shc "${uniq[@]}" 2>/dev/null | tail -1 | awk '{print $1}')
+  for f in "${uniq[@]}"; do
+    if (( DRY_RUN )); then
+      printf '  would delete %s\n' "$f"
+    else
+      rm -rf -- "$f"
+    fi
+  done
+  if (( DRY_RUN )); then
+    ok "dry-run finished (${#uniq[@]} would be deleted, ~$reclaimed)"
+  else
+    ok "deleted ${#uniq[@]} leftover(s), reclaimed ~$reclaimed"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -486,6 +663,34 @@ cmd_install() {
   fi
 }
 
+cmd_config() {
+  local sub=${1:-} key=${2:-} val=${3:-}
+  case $key in
+    dev_root|'') ;;
+    *) die "unknown setting: $key (known: dev_root)" ;;
+  esac
+  case $sub in
+    get)
+      [[ -n $key ]] || die "usage: distrohop config get KEY"
+      local v=""
+      conf_load_kv "$SETTINGS_CONF" "$key" 2>/dev/null || true
+      v=${!key:-}
+      printf '%s\n' "$v"
+      ;;
+    set)
+      [[ -n $key ]] || die "usage: distrohop config set KEY VALUE"
+      mkdir -p "$CONFIG_DIR"
+      touch "$SETTINGS_CONF"
+      local tmp="$SETTINGS_CONF.tmp"
+      grep -vE "^${key}=" "$SETTINGS_CONF" > "$tmp" 2>/dev/null || : > "$tmp"
+      printf '%s=%s\n' "$key" "$val" >> "$tmp"
+      mv "$tmp" "$SETTINGS_CONF"
+      ok "$key=$val → $SETTINGS_CONF"
+      ;;
+    *) die "usage: distrohop config get|set KEY [VALUE]" ;;
+  esac
+}
+
 cmd_edit() {
   ensure_manifest
   local editor=${EDITOR:-${VISUAL:-nano}}
@@ -519,10 +724,15 @@ cmd_status() {
     ((shown)) && printf '\n'
   done
 
-  if group_wanted packages && command -v pacman >/dev/null 2>&1; then
+  if group_wanted packages; then
+    local pm; pm=$(pm_detect)
     printf '%s[packages]%s\n' "$C_BOLD" "$C_RESET"
-    printf '  explicit  %s\n' "$(pacman -Qqe | wc -l)"
-    printf '  aur       %s\n' "$(pacman -Qqm | wc -l)"
+    if [[ $pm != none ]]; then
+      printf '  explicit  %s\n' "$(pm_explicit_packages "$pm" 2>/dev/null | wc -l)"
+      [[ $pm == pacman ]] && printf '  aur       %s\n' "$(pacman -Qqm | wc -l)"
+    else
+      printf '  %s(no supported package manager found)%s\n' "$C_DIM" "$C_RESET"
+    fi
     printf '  flatpak   %s\n' "$(flatpak list --app 2>/dev/null | wc -l)"
     printf '\n'
   fi
@@ -614,10 +824,26 @@ cmd_backup() {
   printf '\n%sNext%s\n' "$C_BOLD" "$C_RESET"
   printf '  restore:   distrohop restore %s\n' "$name"
   printf '  portable:  %s packages\n' "$(wc -l < "$dest/packages/portable.txt")"
-  printf '  desktop:   %s DE-session packages (packages/kde-session.txt)\n' "$(wc -l < "$dest/packages/kde-session.txt")"
+  if [[ -s $dest/packages/kde-session.txt ]]; then
+    printf '  desktop:   %s DE-session packages (packages/kde-session.txt)\n' "$(wc -l < "$dest/packages/kde-session.txt")"
+  fi
   if ! group_wanted secrets; then
     warn "secrets not included — rerun with --secrets to keep ssh keys / rclone"
   fi
+}
+
+# Snapshot directories under $1 (default: active data dir), oldest-first —
+# names are lexicographically time-sortable (YYYY-MM-DD_HHMMSS_host or a
+# custom --name), and bash glob expansion is already lexicographic.
+list_snapshot_dirs() {
+  local dir=${1:-${DEST_OVERRIDE:-$DATA_DIR}} d
+  [[ -d $dir ]] || return 0
+  shopt -s nullglob
+  for d in "$dir"/*/; do
+    [[ -d $d/files || -d $d/meta ]] || continue
+    printf '%s\n' "${d%/}"
+  done
+  shopt -u nullglob
 }
 
 cmd_list() {
@@ -628,16 +854,47 @@ cmd_list() {
   fi
   local d
   printf '%s%-28s %8s  %s%s\n' "$C_DIM" "NAME" "SIZE" "WHEN" "$C_RESET"
-  shopt -s nullglob
-  for d in "$dir"/*/; do
-    [[ -d $d/files || -d $d/meta ]] || continue
+  while IFS= read -r d; do
     local name when size
     name=$(basename "$d")
     when=$(cat "$d/meta/date" 2>/dev/null || echo "?")
     size=$(du -sh "$d" | awk '{print $1}')
     printf '%-28s %8s  %s\n' "$name" "$size" "$when"
+  done < <(list_snapshot_dirs "$dir")
+}
+
+cmd_prune() {
+  local dir=${DEST_OVERRIDE:-$DATA_DIR}
+  local keep=${KEEP_N:-$PRUNE_DEFAULT_KEEP}
+  [[ $keep =~ ^[0-9]+$ ]] || die "--keep must be a non-negative integer"
+  if [[ ! -d $dir ]]; then
+    warn "no snapshots yet in $dir"
+    return 0
+  fi
+
+  local snaps=()
+  while IFS= read -r d; do snaps+=("$d"); done < <(list_snapshot_dirs "$dir")
+  local total=${#snaps[@]}
+  if (( total <= keep )); then
+    info "$total snapshot(s), keeping $keep — nothing to prune"
+    return 0
+  fi
+
+  local drop=$(( total - keep )) i name archive
+  info "$total snapshot(s), keeping $keep newest — pruning $drop"
+  for (( i = 0; i < drop; i++ )); do
+    name=$(basename "${snaps[i]}")
+    if (( DRY_RUN )); then
+      printf '  would delete %s\n' "$name"
+      continue
+    fi
+    rm -rf -- "${snaps[i]}"
+    for archive in "${snaps[i]}.tar.zst" "${snaps[i]}.tar.xz"; do
+      [[ -e $archive ]] && rm -f -- "$archive"
+    done
+    ok "deleted $name"
   done
-  shopt -u nullglob
+  (( DRY_RUN )) && ok "dry-run finished ($drop would be deleted)"
 }
 
 cmd_show() {
@@ -751,10 +1008,9 @@ cmd_packages_dump() {
 }
 
 cmd_packages_apply() {
-  local portable=${1:-0}
-  if ! command -v pacman >/dev/null 2>&1; then
-    die "package apply is implemented for Arch/CachyOS (pacman). On other distros, read packages/portable.txt and install equivalents."
-  fi
+  local portable=${1:-0} pm
+  pm=$(pm_detect)
+  [[ $pm != none ]] || die "no supported package manager found (pacman/dnf/apt/zypper) — read packages/portable.txt and install by hand"
 
   local snap_dir="" list
   # Prefer the newest snapshot's lists
@@ -764,6 +1020,12 @@ cmd_packages_apply() {
     snap_dir=$(ls -1d "${DEST_OVERRIDE:-$DATA_DIR}"/*/ 2>/dev/null | tail -n1 || true)
   fi
   [[ -n $snap_dir && -d $snap_dir/packages ]] || die "no snapshot package lists found — run backup first"
+
+  local snap_pm=""
+  [[ -f $snap_dir/packages/pm.txt ]] && snap_pm=$(<"$snap_dir/packages/pm.txt")
+  if [[ -n $snap_pm && $snap_pm != "$pm" ]]; then
+    warn "snapshot captured on $snap_pm, applying on $pm — some names won't match; unresolved go to packages/unresolved.txt"
+  fi
 
   if (( portable )); then
     list="$snap_dir/packages/portable.txt"
@@ -784,15 +1046,35 @@ cmd_packages_apply() {
     return 0
   fi
 
-  sudo pacman -S --needed -- "${pkgs[@]}" || warn "some repo packages failed (normal if you changed distro flavour)"
+  local resolved=() unresolved=() p
+  for p in "${pkgs[@]}"; do
+    pm_pkg_installed "$pm" "$p" && continue
+    if pm_pkg_available "$pm" "$p"; then
+      resolved+=("$p")
+    else
+      unresolved+=("$p")
+    fi
+  done
+  if ((${#resolved[@]})); then
+    pm_install_batch "$pm" "${resolved[@]}" || warn "some repo packages failed (normal if you changed distro flavour)"
+  fi
+  if ((${#unresolved[@]})); then
+    printf '%s\n' "${unresolved[@]}" > "$snap_dir/packages/unresolved.txt"
+    warn "${#unresolved[@]} packages had no match on $pm — see packages/unresolved.txt"
+  fi
 
-  if [[ -f $snap_dir/packages/aur.txt ]] && command -v paru >/dev/null 2>&1; then
+  if [[ $pm == pacman ]] && [[ -f $snap_dir/packages/aur.txt ]] && command -v paru >/dev/null 2>&1; then
     local aur=()
     if (( portable )); then
-      mapfile -t aur < <(grep -vE '^\s*(#|$)' "$snap_dir/packages/aur.txt" | while read -r p; do
-        is_kde_session "$p" && continue
-        printf '%s\n' "$p"
-      done)
+      if [[ -f $snap_dir/packages/kde-session.txt ]]; then
+        mapfile -t aur < <(grep -vE '^\s*(#|$)' "$snap_dir/packages/aur.txt" | while read -r p; do
+          is_kde_session "$p" && continue
+          printf '%s\n' "$p"
+        done)
+      else
+        warn "no DE-session split in this snapshot — --portable installs all AUR packages unfiltered"
+        mapfile -t aur < <(grep -vE '^\s*(#|$)' "$snap_dir/packages/aur.txt")
+      fi
     else
       mapfile -t aur < <(grep -vE '^\s*(#|$)' "$snap_dir/packages/aur.txt")
     fi
@@ -815,46 +1097,129 @@ cmd_packages_apply() {
 }
 
 cmd_bootstrap() {
-  if ! command -v pacman >/dev/null 2>&1; then
-    die "bootstrap knows Arch/CachyOS package names. Install zsh + p10k + plugins by hand on this distro."
-  fi
+  local pm; pm=$(pm_detect)
+  [[ $pm != none ]] || die "bootstrap needs a supported package manager (pacman/dnf/apt/zypper) — install zsh + a prompt + plugins by hand."
 
-  local repo=(
-    zsh
-    zsh-theme-powerlevel10k
-    zsh-syntax-highlighting
-    zsh-autosuggestions
-    zsh-history-substring-search
-    fzf
-    bat
-    trash-cli
-    fastfetch
-    alacritty
-    pkgfile
-    ttf-meslo-nerd
-    ttf-jetbrains-mono-nerd
-    git
-    github-cli
-  )
-  local aur=(oh-my-zsh-git ttf-victor-mono)
+  if [[ $pm == pacman ]]; then
+    local repo=(
+      zsh
+      zsh-theme-powerlevel10k
+      zsh-syntax-highlighting
+      zsh-autosuggestions
+      zsh-history-substring-search
+      fzf
+      bat
+      trash-cli
+      fastfetch
+      alacritty
+      pkgfile
+      ttf-meslo-nerd
+      ttf-jetbrains-mono-nerd
+      git
+      github-cli
+    )
+    local aur=(oh-my-zsh-git ttf-victor-mono)
 
-  info "shell + prompt + fonts that your zshrc expects"
-  if (( DRY_RUN )); then
-    printf 'pacman: %s\n' "${repo[*]}"
-    printf 'aur:    %s\n' "${aur[*]}"
-    return 0
-  fi
+    info "shell + prompt + fonts that your zshrc expects"
+    if (( DRY_RUN )); then
+      printf 'pacman: %s\n' "${repo[*]}"
+      printf 'aur:    %s\n' "${aur[*]}"
+      return 0
+    fi
 
-  sudo pacman -S --needed -- "${repo[@]}"
-  if command -v paru >/dev/null 2>&1; then
-    paru -S --needed -- "${aur[@]}"
+    sudo pacman -S --needed -- "${repo[@]}"
+    if command -v paru >/dev/null 2>&1; then
+      paru -S --needed -- "${aur[@]}"
+    else
+      warn "paru not found — install oh-my-zsh-git and ttf-victor-mono from the AUR yourself"
+    fi
   else
-    warn "paru not found — install oh-my-zsh-git and ttf-victor-mono from the AUR yourself"
+    # No AUR-equivalent on dnf/apt/zypper: install what's packaged, git-clone
+    # the rest (oh-my-zsh, p10k, plugins) instead of running oh-my-zsh's
+    # interactive installer (it mutates .zshrc, which distrohop restores
+    # separately as the user's own file).
+    local repo_names=(zsh fzf bat trash-cli fastfetch alacritty git github-cli)
+    info "shell + prompt + fonts that your zshrc expects ($pm)"
+
+    local resolved=() unresolved=() name cand r
+    for name in "${repo_names[@]}"; do
+      r=""
+      while IFS= read -r cand; do
+        [[ -z $cand ]] && continue
+        if pm_pkg_available "$pm" "$cand"; then r=$cand; break; fi
+      done < <(pm_map_pkg "$pm" "$name")
+      if [[ -n $r ]]; then resolved+=("$r"); else unresolved+=("$name"); fi
+    done
+
+    if (( DRY_RUN )); then
+      printf '%s: %s\n' "$pm" "${resolved[*]}"
+      ((${#unresolved[@]})) && printf 'no package found for: %s\n' "${unresolved[*]}"
+      printf 'git-clone → ~/.local/share/distrohop/zsh-plugins: oh-my-zsh, powerlevel10k, zsh-autosuggestions, zsh-syntax-highlighting, zsh-history-substring-search\n'
+      return 0
+    fi
+
+    ((${#resolved[@]})) && { pm_install_batch "$pm" "${resolved[@]}" || warn "some repo packages failed"; }
+    ((${#unresolved[@]})) && warn "no $pm package for: ${unresolved[*]} — install by hand"
+
+    local plugdir="$HOME/.local/share/distrohop/zsh-plugins"
+    mkdir -p "$plugdir"
+    local -A clones=(
+      [oh-my-zsh]=https://github.com/ohmyzsh/ohmyzsh.git
+      [powerlevel10k]=https://github.com/romkatv/powerlevel10k.git
+      [zsh-autosuggestions]=https://github.com/zsh-users/zsh-autosuggestions.git
+      [zsh-syntax-highlighting]=https://github.com/zsh-users/zsh-syntax-highlighting.git
+      [zsh-history-substring-search]=https://github.com/zsh-users/zsh-history-substring-search.git
+    )
+    local plug
+    for plug in "${!clones[@]}"; do
+      if [[ -d $plugdir/$plug/.git ]]; then
+        info "already cloned: $plug"
+      else
+        info "git clone $plug"
+        git clone --depth 1 "${clones[$plug]}" "$plugdir/$plug" || warn "clone failed: $plug"
+      fi
+    done
+    info "note: .zshrc may need to source these from $plugdir instead of the Arch /usr/share/... paths it expects"
+
+    # Fonts: try a repo package first, else fall back to the upstream
+    # nerd-fonts release zips (best-effort; version may need bumping later).
+    local fonts_dir="$HOME/.local/share/fonts" have_font_pkg=0
+    mkdir -p "$fonts_dir"
+    for cand in jetbrains-mono-fonts jetbrains-mono-nerd-fonts nerd-fonts-jetbrains-mono; do
+      if pm_pkg_available "$pm" "$cand"; then
+        pm_install_batch "$pm" "$cand" && have_font_pkg=1
+        break
+      fi
+    done
+    if (( ! have_font_pkg )); then
+      if command -v curl >/dev/null 2>&1 && command -v unzip >/dev/null 2>&1; then
+        info "downloading JetBrainsMono + Meslo + VictorMono Nerd Fonts"
+        local nf_ver=3.3.0 fontname tmpzip
+        for fontname in JetBrainsMono Meslo VictorMono; do
+          tmpzip=$(mktemp)
+          if curl -fsSL "https://github.com/ryanoasis/nerd-fonts/releases/download/v${nf_ver}/${fontname}.zip" -o "$tmpzip"; then
+            unzip -o -q "$tmpzip" -d "$fonts_dir" '*.ttf' '*.otf' 2>/dev/null
+            ok "installed $fontname Nerd Font"
+          else
+            warn "font download failed: $fontname — install manually from the nerd-fonts GitHub releases"
+          fi
+          rm -f "$tmpzip"
+        done
+        fc-cache -f "$fonts_dir" >/dev/null 2>&1 || true
+      else
+        warn "curl/unzip not found — install JetBrainsMono/Meslo/VictorMono Nerd Fonts by hand"
+      fi
+    fi
   fi
 
   if [[ $SHELL != *zsh ]]; then
     info "switching login shell to zsh"
-    chsh -s /usr/bin/zsh || warn "chsh failed — run: chsh -s /usr/bin/zsh"
+    local zsh_bin; zsh_bin=$(command -v zsh || true)
+    if [[ -n $zsh_bin ]]; then
+      chsh -s "$zsh_bin" || warn "chsh failed — run: chsh -s $zsh_bin"
+    else
+      warn "zsh not found on PATH — install it first"
+    fi
   fi
   ok "bootstrap done — open a new terminal"
 }
@@ -899,10 +1264,13 @@ while [[ $# -gt 0 ]]; do
     --gh) WANT_GH=1; shift ;;
     --yes|-y) WANT_YES=1; shift ;;
     --portable) PORTABLE=1; shift ;;
+    --no-verify) WANT_NO_VERIFY=1; shift ;;
     --name) NAME_OVERRIDE=${2:?}; shift 2 ;;
     --dest) DEST_OVERRIDE=${2:?}; shift 2 ;;
     --groups) GROUPS_OVERRIDE=${2:?}; shift 2 ;;
     --with) WITH_GROUPS=${2:?}; shift 2 ;;
+    --keep) KEEP_N=${2:?}; shift 2 ;;
+    --older-than) OLDER_THAN=${2:?}; shift 2 ;;
     --) shift; POSITIONAL+=("$@"); break ;;
     -*) die "unknown flag: $1" ;;
     *) POSITIONAL+=("$1"); shift ;;
@@ -931,6 +1299,9 @@ case $cmd in
   clone)
     cmd_clone "${1:-}"
     ;;
+  prune) cmd_prune ;;
+  clean) cmd_clean ;;
+  config) cmd_config "${1:-}" "${2:-}" "${3:-}" ;;
   packages)
     sub=${1:-}
     case $sub in

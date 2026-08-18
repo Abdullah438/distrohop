@@ -3,29 +3,13 @@
 S3_CONF="${S3_CONF:-$CONFIG_DIR/s3.conf}"
 
 s3_load_conf() {
-  [[ -f $S3_CONF ]] || return 1
-  # shellcheck disable=SC1090
-  set -a
-  # key=value file; ignore comments / blanks
-  while IFS= read -r line || [[ -n $line ]]; do
-    [[ -z $line || $line == \#* ]] && continue
-    [[ $line == *'='* ]] || continue
-    local k=${line%%=*} v=${line#*=}
-    k=${k//[[:space:]]/}
-    v=${v#\"}; v=${v%\"}
-    v=${v#\'}; v=${v%\'}
-    case $k in
-      endpoint|bucket|prefix|access_key|secret_key|region)
-        printf -v "$k" '%s' "$v"
-        ;;
-    esac
-  done < "$S3_CONF"
-  set +a
+  conf_load_kv "$S3_CONF" endpoint bucket prefix access_key secret_key region || return 1
   [[ -n ${endpoint:-} && -n ${bucket:-} && -n ${access_key:-} && -n ${secret_key:-} ]]
 }
 
-s3_import_khata_env() {
-  local envfile=${1:-$HOME/Dev/Fullstack/khata/.env}
+s3_import_env() {
+  local envfile=$1
+  [[ -n $envfile ]] || die "usage: distrohop s3 configure ENVFILE"
   [[ -f $envfile ]] || die "no env file at $envfile"
   python3 - "$envfile" "$S3_CONF" <<'PY'
 import re, sys
@@ -60,17 +44,8 @@ PY
 }
 
 s3_ensure() {
-  if s3_load_conf; then
-    return 0
-  fi
-  local khata="$HOME/Dev/Fullstack/khata/.env"
-  if [[ -f $khata ]]; then
-    info "no $S3_CONF — importing R2 keys from khata"
-    s3_import_khata_env "$khata"
-    s3_load_conf || die "imported $S3_CONF but it is incomplete"
-    return 0
-  fi
-  die "no S3 config. Copy s3.conf.example to $S3_CONF or run: distrohop s3 configure"
+  s3_load_conf && return 0
+  die "no S3 config. Copy s3.conf.example to $S3_CONF, or run: distrohop s3 configure ENVFILE"
 }
 
 # rclone S3 remote path is remote:BUCKET/key
@@ -124,9 +99,7 @@ cmd_s3_configure() {
   local from=${1:-}
   mkdir -p "$CONFIG_DIR"
   if [[ -n $from ]]; then
-    s3_import_khata_env "$from"
-  elif [[ -f $HOME/Dev/Fullstack/khata/.env ]]; then
-    s3_import_khata_env "$HOME/Dev/Fullstack/khata/.env"
+    s3_import_env "$from"
   else
     local example="$SCRIPT_DIR/s3.conf.example"
     [[ -f $example ]] || die "missing $example"
@@ -171,6 +144,10 @@ cmd_s3_push() {
     return 0
   fi
   rclone copy "$snap" "$dest" -P --s3-no-check-bucket
+  if (( ! WANT_NO_VERIFY )); then
+    info "verifying upload"
+    rclone check "$snap" "$dest" --one-way || die "verification FAILED for $name — re-run: distrohop s3 push $name"
+  fi
   ok "uploaded $name  ($(du -sh "$snap" | awk '{print $1}'))"
   info "pull later with:  distrohop s3 pull $name"
 }
@@ -198,6 +175,10 @@ cmd_s3_pull() {
     return 0
   fi
   rclone copy "r2:${src}" "$dest" -P --s3-no-check-bucket
+  if (( ! WANT_NO_VERIFY )); then
+    info "verifying download"
+    rclone check "r2:${src}" "$dest" --one-way || die "verification FAILED for $dest — re-run: distrohop s3 pull $name"
+  fi
   ok "pulled $dest"
 }
 
@@ -210,6 +191,41 @@ cmd_s3_ls() {
   rclone lsd "r2:${pfx}" 2>/dev/null || rclone ls "r2:${pfx}" | head -50
 }
 
+cmd_s3_prune() {
+  local keep=${KEEP_N:-$PRUNE_DEFAULT_KEEP}
+  [[ $keep =~ ^[0-9]+$ ]] || die "--keep must be a non-negative integer"
+  s3_rclone_env
+  local pfx
+  pfx=$(s3_remote_path "")
+  pfx=${pfx%/}
+
+  local names=() n
+  while IFS= read -r n; do
+    [[ -n $n ]] && names+=("${n%/}")
+  done < <(rclone lsf "r2:${pfx}" --dirs-only 2>/dev/null | sort)
+  local total=${#names[@]}
+  if (( total <= keep )); then
+    info "$total remote snapshot(s), keeping $keep — nothing to prune"
+    return 0
+  fi
+
+  local drop=$(( total - keep )) i name
+  info "$total remote snapshot(s), keeping $keep newest — pruning $drop"
+  for (( i = 0; i < drop; i++ )); do
+    name=${names[i]}
+    if (( DRY_RUN )); then
+      printf '  would delete r2:%s\n' "$(s3_remote_path "$name")"
+      continue
+    fi
+    if rclone purge "r2:$(s3_remote_path "$name")"; then
+      ok "deleted $name"
+    else
+      warn "failed to delete $name"
+    fi
+  done
+  (( DRY_RUN )) && ok "dry-run finished ($drop would be deleted)"
+}
+
 cmd_s3() {
   local sub=${1:-}
   shift || true
@@ -218,6 +234,7 @@ cmd_s3() {
     push)      cmd_s3_push "${1:-}" ;;
     pull)      cmd_s3_pull "${1:-}" ;;
     ls|list)   cmd_s3_ls ;;
-    *) die "usage: distrohop s3 configure|push|pull|ls  [NAME]" ;;
+    prune)     cmd_s3_prune ;;
+    *) die "usage: distrohop s3 configure|push|pull|ls|prune  [NAME]" ;;
   esac
 }

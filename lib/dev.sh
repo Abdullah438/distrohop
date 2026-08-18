@@ -1,7 +1,7 @@
 # sourced by distrohop — ~/Dev inventory, clone map, envs, compose volumes
 # shellcheck disable=SC2034
 
-DEV_ROOT="${DISTROHOP_DEV:-$HOME/Dev}"
+DEV_ROOT="${DISTROHOP_DEV:-${dev_root:-$HOME/Dev}}"
 
 dev_repos() {
   # prints: relpath<TAB>branch<TAB>origin
@@ -35,7 +35,8 @@ dev_env_files() {
 }
 
 dev_bind_paths() {
-  # extra paths from the [dev] manifest section, plus known compose bind-mounts
+  # extra bind-mount / data dirs from the [dev] manifest section — add yours
+  # with `distrohop edit`.
   local rel
   if [[ -f $MANIFEST ]]; then
     while IFS= read -r rel; do
@@ -43,13 +44,6 @@ dev_bind_paths() {
       printf '%s\n' "$rel"
     done < <(parse_manifest dev)
   fi
-  local p
-  for p in \
-    "Dev/Python/myed-backend/data" \
-    "Dev/Python/quexter/data"
-  do
-    [[ -d $HOME/$p ]] && printf '%s\n' "$p"
-  done
   return 0
 }
 
@@ -515,9 +509,14 @@ dev_compose_up() {
   done < <(find "$DEV_ROOT" -maxdepth 4 -type f \( -name docker-compose.yml -o -name docker-compose.yaml \) \
     ! -path '*/node_modules/*' -print0 2>/dev/null)
 
-  if [[ -d $DEV_ROOT/Fullstack/parami-erp ]] && command -v supabase >/dev/null 2>&1; then
-    info "supabase start  Fullstack/parami-erp"
-    (cd "$DEV_ROOT/Fullstack/parami-erp" && supabase start) || warn "supabase start failed"
+  if command -v supabase >/dev/null 2>&1; then
+    local cfg proj
+    while IFS= read -r -d '' cfg; do
+      proj=$(dirname "$(dirname "$cfg")")
+      info "supabase start  ${proj#"$DEV_ROOT"/}"
+      (cd "$proj" && supabase start) || warn "supabase start failed: $proj"
+    done < <(find "$DEV_ROOT" -maxdepth 4 -type f -name config.toml -path '*/supabase/*' \
+      ! -path '*/node_modules/*' -print0 2>/dev/null)
   fi
 
   if command -v pm2 >/dev/null 2>&1 && [[ -f $HOME/.pm2/dump.pm2 || -f $snap/dev/dump.pm2 ]]; then
