@@ -1,6 +1,10 @@
 # distrohop
 
-Snapshot the configs, dev-environment state, and package lists that should survive a reinstall, then put them back. distrohop doesn't assume a specific distro, desktop environment, or folder layout — it works with pacman, dnf, apt, or zypper, detects the live desktop session instead of hardcoding one, and every dev-tree path is something you configure, not something baked in.
+*Reinstall the distro. Keep the parts of your life that took years to configure.*
+
+Every distro hop is the same trade: a fresh install in twenty minutes, then three days rebuilding zsh, re-authing `gh`, remembering which `.env` files existed, and guessing at the seventeen packages you forgot you had. distrohop is the part that remembers for you — it snapshots the configs, dev-environment state, and package lists that should survive a reinstall, then puts them back on the new box.
+
+It isn't a dotfiles manager and it doesn't symlink anything into place — it copies, so a bad restore never corrupts your live config. And it doesn't assume a specific distro, desktop environment, or folder layout: it works with pacman, dnf, apt, or zypper, detects the live desktop session instead of hardcoding one, and every dev-tree path is something you configure, not something baked in.
 
 ## Requirements
 
@@ -36,13 +40,13 @@ distrohop backup --name workstation --secrets --archive
 distrohop backup --name workstation --secrets --push  # backup, then upload to S3/R2
 ```
 
-Default groups are `core apps gtk editor packages dev`. Secrets are opt-in (`--secrets`). Containers that touch the backed-up docker volumes or data dirs are stopped before the copy and started again right after, so the copies are consistent.
+Default groups are `core apps gtk editor packages dev`. Secrets are opt-in (`--secrets`) — nothing sensitive leaves your machine unless you explicitly ask it to. Containers that touch the backed-up docker volumes or data dirs are stopped before the copy and started again right after, so the copies are consistent, not half-written.
 
 `--push` uploads the snapshot to S3/R2 right after it's written (same as running `distrohop s3 push NAME` afterward) — see [S3 / Cloudflare R2](#s3--cloudflare-r2) for setup. It does not force `--secrets`; only what you told `backup` to include gets uploaded.
 
-Your dev tree's git trees are never copied. The snapshot records each GitHub remote and folder (e.g. `Fullstack/myapp`, `Python/mylib`, …) plus a `clone-dev.sh` that rebuilds the tree.
+Your dev tree's git trees are never copied — that's what GitHub is for. The snapshot records each remote and folder (e.g. `Fullstack/myapp`, `Python/mylib`, …) plus a `clone-dev.sh` that rebuilds the tree from scratch.
 
-`.env` files and docker volumes *are* copied (they are not in git). They sit under `dev/envs` and `dev/volumes` and are gitignored so a public push of this app does not leak them.
+`.env` files and docker volumes *are* copied (they are not in git, and nobody enjoys reconstructing a `.env` from memory). They sit under `dev/envs` and `dev/volumes` and are gitignored so a public push of this app does not leak them.
 
 Backup also writes `packages/dev-apps.json` — Cursor, VS Code, Docker, nvm, pyenv, and similar tools that were on the machine, with enough detail to try an automated reinstall later.
 
@@ -50,14 +54,14 @@ Copy `~/Backups/distrohop/` onto a USB, or commit the clone map (`dev/repos.tsv`
 
 Old snapshots pile up — `distrohop prune` deletes everything but the 10 most recent (`--keep N` to change that, `--dry-run` to preview).
 
-`distrohop list` (alias `ls`) shows every local snapshot, newest first, with its size. If `s3.conf` is set up it also checks the remote (one `rclone` call, 5s timeout) and marks each snapshot `✔ pushed` or `— local only`.
+`distrohop list` (alias `ls`) shows every local snapshot, newest first, with its size. If `s3.conf` is set up it also checks the remote (one `rclone` call, 5s timeout) and marks each snapshot `✔ pushed` or `— local only`, so you never have to wonder if last night's backup actually made it off the machine.
 
 ```bash
 distrohop list
 distrohop ls                                   # same thing
 ```
 
-`distrohop delete NAME` (alias `rm`) removes a single named snapshot from both the local `Backups/distrohop/` folder and S3/R2 (if configured). `--local-only` / `--s3-only` limit it to one side; `--dry-run` previews without deleting.
+`distrohop delete NAME` (alias `rm`) removes a single named snapshot from both the local `Backups/distrohop/` folder and S3/R2 (if configured), for when "keep the 10 newest" isn't precise enough. `--local-only` / `--s3-only` limit it to one side; `--dry-run` previews without deleting.
 
 ```bash
 distrohop delete workstation                   # local + remote
@@ -80,7 +84,7 @@ distrohop bootstrap                         # zsh, p10k, plugins, fonts
 distrohop packages apply --portable
 ```
 
-If you tick **development apps**, distrohop tries the native package manager (**pacman/AUR**, **dnf**, **apt**, or **zypper**), then nvm / pyenv / npm. Arch names are mapped (e.g. `github-cli` → `gh`, `docker` → `docker.io` on Debian). Anything with no package (Cursor, Postman, Android Studio, …) is listed as a manual step.
+If you tick **development apps**, distrohop tries the native package manager (**pacman/AUR**, **dnf**, **apt**, or **zypper**), then nvm / pyenv / npm. Arch names are mapped (e.g. `github-cli` → `gh`, `docker` → `docker.io` on Debian). Anything with no package (Cursor, Postman, Android Studio, …) is listed as a manual step — distrohop knows its limits, it isn't going to click through an installer wizard for you.
 
 `distrohop bootstrap` installs zsh/p10k/plugins as system packages on Arch (AUR via `paru`); on dnf/apt/zypper it installs what's packaged and git-clones the rest into `~/.local/share/distrohop/zsh-plugins`.
 
@@ -92,11 +96,11 @@ Leftover `*.pre-hop.*` backups from past restores don't clean themselves up — 
 
 ## S3 / Cloudflare R2
 
-Uploads the **whole** snapshot, including `secrets/`, `.env` files, and docker volumes.
+Uploads the **whole** snapshot, including `secrets/`, `.env` files, and docker volumes — this is the "distro dies, laptop gets stolen, house burns down" tier of backup, not just a local safety net.
 
 Objects land at `bucket/<snapshot-name>` (for example `distrohop/workstation`). Leave `prefix=` empty in `s3.conf` — a non-empty prefix would nest an extra folder inside the bucket.
 
-Runtime credentials are **`~/.config/distrohop/s3.conf`** (not a `.env`, not in git, not inside the R2 snapshot). Keep a copy of that file somewhere else (1Password, USB) — it is the bootstrap. On a blank machine you need it first, then you can pull:
+Runtime credentials are **`~/.config/distrohop/s3.conf`** (not a `.env`, not in git, not inside the R2 snapshot). Keep a copy of that file somewhere else (1Password, USB) — it is the bootstrap, the one thing that has to survive outside the loop. On a blank machine you need it first, then you can pull:
 
 ```bash
 # 1. restore s3.conf from your offline copy
@@ -119,7 +123,7 @@ distrohop s3 pull workstation
 distrohop s3 prune --keep 5                    # delete all but the 5 newest remote snapshots
 ```
 
-Every push/pull is checksum-verified against the remote afterward (`--no-verify` to skip).
+Every push/pull is checksum-verified against the remote afterward (`--no-verify` to skip) — silent corruption is a worse failure mode than a loud one.
 
 If an older push created a `distrohop/` folder inside the bucket, those objects are at `distrohop/distrohop/<name>`. Re-push after this fix, or copy them up one level in the R2 dashboard.
 
@@ -127,7 +131,7 @@ Desktop settings (dconf) can be saved and reloaded with `distrohop dconf export`
 
 ## Scheduled backups (systemd)
 
-`systemd/` ships a user timer that runs `distrohop backup --secrets --push` once a day. It uses the `%h` specifier and `hostname -s`, so it works as-is on any machine — nothing to edit.
+`systemd/` ships a user timer that runs `distrohop backup --secrets --push` once a day, so "I'll back up before I reinstall" stops being a lie you tell yourself. It uses the `%h` specifier and `hostname -s`, so it works as-is on any machine — nothing to edit.
 
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -146,3 +150,7 @@ systemctl --user disable --now distrohop-backup.timer  # turn it off
 ```
 
 Edit what gets copied: `distrohop edit`.
+
+## What this isn't
+
+Worth saying plainly: distrohop is not a full-system image tool, not a dotfiles-as-symlinks manager, and not a substitute for real backups of things you can't regenerate (photos, databases, anything precious). It's narrowly good at one job — carrying configuration and dev-environment state across a reinstall — and it stays out of the way of everything else on purpose.
