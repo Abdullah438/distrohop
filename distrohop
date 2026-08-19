@@ -31,6 +31,8 @@ WANT_YES=0
 WANT_NO_VERIFY=0
 WANT_PUSH=0
 WANT_PULL=0
+WANT_LOCAL_ONLY=0
+WANT_S3_ONLY=0
 DEST_OVERRIDE=""
 NAME_OVERRIDE=""
 GROUPS_OVERRIDE=""
@@ -67,6 +69,7 @@ ${C_BOLD}USAGE${C_RESET}
   distrohop restore SNAPSHOT [--groups LIST] [--with LIST] [--secrets] [--up] [--yes] [--dry-run] [--pull]
   distrohop clone   [SNAPSHOT] [--gh] [--dry-run]
   distrohop prune   [--keep N] [--dry-run]
+  distrohop delete  NAME [--local-only|--s3-only] [--dry-run]   (alias: rm)
   distrohop clean   [--older-than DAYS] [--dry-run]
   distrohop s3      configure ENVFILE | push [SNAPSHOT] [--no-verify] | pull NAME [--no-verify] | ls | prune [--keep N]
   distrohop list    (alias: ls)   — newest first, shows S3 push status if s3 is configured
@@ -103,6 +106,9 @@ ${C_BOLD}EXAMPLES${C_RESET}
   distrohop restore workstation --up
   distrohop clone workstation --gh
   distrohop prune --keep 5
+  distrohop delete workstation                  # remove local + remote copy
+  distrohop delete workstation --local-only
+  distrohop delete workstation --s3-only
   distrohop clean --older-than 30
   distrohop s3 push workstation
   distrohop s3 pull workstation
@@ -952,6 +958,69 @@ cmd_prune() {
   (( DRY_RUN )) && ok "dry-run finished ($drop would be deleted)"
 }
 
+cmd_delete() {
+  local name=${1:-}
+  [[ -n $name ]] || die "usage: distrohop delete NAME [--local-only|--s3-only] [--dry-run]"
+  (( WANT_LOCAL_ONLY && WANT_S3_ONLY )) && die "--local-only and --s3-only are mutually exclusive"
+
+  local do_local=1 do_s3=1
+  (( WANT_LOCAL_ONLY )) && do_s3=0
+  (( WANT_S3_ONLY )) && do_local=0
+  local found=0
+
+  if (( do_local )); then
+    local dir=${DEST_OVERRIDE:-$DATA_DIR} snap archive
+    snap="$dir/$name"
+    if [[ -d $snap ]]; then
+      found=1
+      if (( DRY_RUN )); then
+        printf '  would delete local  %s\n' "$snap"
+      else
+        rm -rf -- "$snap"
+        ok "deleted local $name"
+      fi
+      for archive in "$snap.tar.zst" "$snap.tar.xz"; do
+        [[ -e $archive ]] || continue
+        found=1
+        if (( DRY_RUN )); then
+          printf '  would delete local  %s\n' "$archive"
+        else
+          rm -f -- "$archive"
+          ok "deleted local archive $(basename "$archive")"
+        fi
+      done
+    elif (( do_s3 )); then
+      warn "no local snapshot named $name"
+    else
+      die "no local snapshot named $name"
+    fi
+  fi
+
+  if (( do_s3 )); then
+    if declare -F s3_load_conf >/dev/null && s3_load_conf 2>/dev/null; then
+      s3_rclone_env
+      local remote="r2:$(s3_remote_path "$name")"
+      if rclone lsf "$remote" --max-depth 1 2>/dev/null | grep -q .; then
+        found=1
+        if (( DRY_RUN )); then
+          printf '  would delete remote %s\n' "$remote"
+        else
+          rclone purge "$remote" && ok "deleted remote $name" || die "failed to delete $remote"
+        fi
+      elif (( do_local )); then
+        warn "no remote snapshot named $name"
+      else
+        die "no remote snapshot named $name"
+      fi
+    elif (( WANT_S3_ONLY )); then
+      die "no s3 config — can't delete remote copy (distrohop s3 configure ENVFILE)"
+    fi
+  fi
+
+  (( found )) || die "nothing found named $name (local or remote)"
+  (( DRY_RUN )) && ok "dry-run finished"
+}
+
 cmd_show() {
   local snap
   snap=$(resolve_snapshot "${1:-}")
@@ -1329,6 +1398,8 @@ while [[ $# -gt 0 ]]; do
     --no-verify) WANT_NO_VERIFY=1; shift ;;
     --push) WANT_PUSH=1; shift ;;
     --pull) WANT_PULL=1; shift ;;
+    --local-only) WANT_LOCAL_ONLY=1; shift ;;
+    --s3-only) WANT_S3_ONLY=1; shift ;;
     --name) NAME_OVERRIDE=${2:?}; shift 2 ;;
     --dest) DEST_OVERRIDE=${2:?}; shift 2 ;;
     --groups) GROUPS_OVERRIDE=${2:?}; shift 2 ;;
@@ -1364,6 +1435,10 @@ case $cmd in
     cmd_clone "${1:-}"
     ;;
   prune) cmd_prune ;;
+  delete|rm)
+    [[ $# -ge 1 ]] || die "usage: distrohop delete NAME [--local-only|--s3-only]"
+    cmd_delete "$1"
+    ;;
   clean) cmd_clean ;;
   config) cmd_config "${1:-}" "${2:-}" "${3:-}" ;;
   packages)

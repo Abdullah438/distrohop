@@ -57,6 +57,14 @@ distrohop list
 distrohop ls                                   # same thing
 ```
 
+`distrohop delete NAME` (alias `rm`) removes a single named snapshot from both the local `Backups/distrohop/` folder and S3/R2 (if configured). `--local-only` / `--s3-only` limit it to one side; `--dry-run` previews without deleting.
+
+```bash
+distrohop delete workstation                   # local + remote
+distrohop delete workstation --local-only
+distrohop delete workstation --s3-only
+```
+
 ## Restore
 
 On a TTY, restore opens a checkbox list of what is in the snapshot. Tick what you want (secrets, package install, and development apps are optional). `--yes` skips the prompt and restores the defaults. `--groups` skips the prompt and restores only what you listed.
