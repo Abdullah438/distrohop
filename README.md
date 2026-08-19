@@ -125,4 +125,24 @@ If an older push created a `distrohop/` folder inside the bucket, those objects 
 
 Desktop settings (dconf) can be saved and reloaded with `distrohop dconf export` / `import` after the session is up.
 
+## Scheduled backups (systemd)
+
+`systemd/` ships a user timer that runs `distrohop backup --secrets --push` once a day. It uses the `%h` specifier and `hostname -s`, so it works as-is on any machine — nothing to edit.
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp systemd/distrohop-backup.* ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now distrohop-backup.timer
+```
+
+Requires `s3.conf` to already be set up (see above). Defaults to 21:00 daily — edit `OnCalendar=` in `distrohop-backup.timer` to change it. `Persistent=true` means a missed run (machine off/asleep) fires as soon as the session is back.
+
+```bash
+systemctl --user list-timers distrohop-backup.timer   # confirm next run
+journalctl --user -u distrohop-backup.service          # check logs
+systemctl --user start distrohop-backup.service        # trigger one manually
+systemctl --user disable --now distrohop-backup.timer  # turn it off
+```
+
 Edit what gets copied: `distrohop edit`.
