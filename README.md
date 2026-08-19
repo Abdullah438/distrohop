@@ -50,6 +50,13 @@ Copy `~/Backups/distrohop/` onto a USB, or commit the clone map (`dev/repos.tsv`
 
 Old snapshots pile up — `distrohop prune` deletes everything but the 10 most recent (`--keep N` to change that, `--dry-run` to preview).
 
+`distrohop list` (alias `ls`) shows every local snapshot, newest first, with its size. If `s3.conf` is set up it also checks the remote (one `rclone` call, 5s timeout) and marks each snapshot `✔ pushed` or `— local only`.
+
+```bash
+distrohop list
+distrohop ls                                   # same thing
+```
+
 ## Restore
 
 On a TTY, restore opens a checkbox list of what is in the snapshot. Tick what you want (secrets, package install, and development apps are optional). `--yes` skips the prompt and restores the defaults. `--groups` skips the prompt and restores only what you listed.

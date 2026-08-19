@@ -69,7 +69,7 @@ ${C_BOLD}USAGE${C_RESET}
   distrohop prune   [--keep N] [--dry-run]
   distrohop clean   [--older-than DAYS] [--dry-run]
   distrohop s3      configure ENVFILE | push [SNAPSHOT] [--no-verify] | pull NAME [--no-verify] | ls | prune [--keep N]
-  distrohop list
+  distrohop list    (alias: ls)   — newest first, shows S3 push status if s3 is configured
   distrohop show    SNAPSHOT
   distrohop status  [--groups LIST]
   distrohop packages dump | apply [--portable] [--dry-run]
@@ -862,15 +862,60 @@ cmd_list() {
     warn "no snapshots yet in $dir"
     return 0
   fi
-  local d
-  printf '%s%-28s %8s  %s%s\n' "$C_DIM" "NAME" "SIZE" "WHEN" "$C_RESET"
+
+  local -a entries=()
+  local d when
   while IFS= read -r d; do
-    local name when size
-    name=$(basename "$d")
-    when=$(cat "$d/meta/date" 2>/dev/null || echo "?")
-    size=$(du -sh "$d" | awk '{print $1}')
-    printf '%-28s %8s  %s\n' "$name" "$size" "$when"
+    when=$(cat "$d/meta/date" 2>/dev/null || echo "")
+    entries+=("${when:-0000-00-00T00:00:00}"$'\t'"$d")
   done < <(list_snapshot_dirs "$dir")
+
+  if (( ${#entries[@]} == 0 )); then
+    warn "no snapshots yet in $dir"
+    return 0
+  fi
+
+  # Cross-reference against S3/R2 (best-effort, single remote listing).
+  # Skipped silently if s3 isn't configured, or times out if offline.
+  local -a remote_names=()
+  local check_remote=0
+  if declare -F s3_load_conf >/dev/null && s3_load_conf 2>/dev/null; then
+    check_remote=1
+    local remote
+    remote=$(s3_rclone_env 2>/dev/null && timeout 5 rclone lsf "r2:$(s3_remote_path '')" --dirs-only 2>/dev/null)
+    while IFS= read -r n; do
+      [[ -n $n ]] && remote_names+=("${n%/}")
+    done <<< "$remote"
+  fi
+
+  local header_fmt='%s%-28s %8s  %-25s'
+  (( check_remote )) && header_fmt+='  %s'
+  header_fmt+='%s\n'
+  if (( check_remote )); then
+    printf "$header_fmt" "$C_DIM" "NAME" "SIZE" "WHEN" "S3" "$C_RESET"
+  else
+    printf "$header_fmt" "$C_DIM" "NAME" "SIZE" "WHEN" "$C_RESET"
+  fi
+
+  local line name size mark n found
+  while IFS=$'\t' read -r when d; do
+    name=$(basename "$d")
+    size=$(du -sh "$d" | awk '{print $1}')
+    if (( check_remote )); then
+      found=0
+      for n in "${remote_names[@]}"; do
+        [[ $n == "$name" ]] && { found=1; break; }
+      done
+      if (( found )); then
+        mark="${C_GRN}✔ pushed${C_RESET}"
+      else
+        mark="${C_DIM}— local only${C_RESET}"
+      fi
+      printf '%-28s %8s  %-25s  %b\n' "$name" "$size" "$when" "$mark"
+    else
+      printf '%-28s %8s  %s\n' "$name" "$size" "$when"
+    fi
+  done < <(printf '%s\n' "${entries[@]}" | sort -t $'\t' -k1,1 -r)
 }
 
 cmd_prune() {
@@ -1306,7 +1351,7 @@ case $cmd in
   edit) cmd_edit ;;
   status) cmd_status ;;
   backup) cmd_backup ;;
-  list) cmd_list ;;
+  list|ls) cmd_list ;;
   show)
     [[ $# -ge 1 ]] || die "usage: distrohop show SNAPSHOT"
     cmd_show "$1"
