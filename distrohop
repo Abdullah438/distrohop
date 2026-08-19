@@ -29,6 +29,8 @@ WANT_UP=0
 WANT_GH=0
 WANT_YES=0
 WANT_NO_VERIFY=0
+WANT_PUSH=0
+WANT_PULL=0
 DEST_OVERRIDE=""
 NAME_OVERRIDE=""
 GROUPS_OVERRIDE=""
@@ -61,8 +63,8 @@ usage() {
 ${C_BOLD}distrohop${C_RESET} ${C_DIM}v$VERSION${C_RESET} — backup the configs that survive a distro hop
 
 ${C_BOLD}USAGE${C_RESET}
-  distrohop backup  [--name NAME] [--dest DIR] [--groups LIST] [--with LIST] [--secrets] [--archive]
-  distrohop restore SNAPSHOT [--groups LIST] [--with LIST] [--secrets] [--up] [--yes] [--dry-run]
+  distrohop backup  [--name NAME] [--dest DIR] [--groups LIST] [--with LIST] [--secrets] [--archive] [--push]
+  distrohop restore SNAPSHOT [--groups LIST] [--with LIST] [--secrets] [--up] [--yes] [--dry-run] [--pull]
   distrohop clone   [SNAPSHOT] [--gh] [--dry-run]
   distrohop prune   [--keep N] [--dry-run]
   distrohop clean   [--older-than DAYS] [--dry-run]
@@ -93,9 +95,11 @@ ${C_BOLD}SETTINGS${C_RESET}  (distrohop config get|set KEY VALUE)
 ${C_BOLD}EXAMPLES${C_RESET}
   distrohop backup --name workstation
   distrohop backup --secrets
+  distrohop backup --secrets --push             # backup, then upload to S3/R2
   distrohop backup --dest /run/media/$USER/USB --archive --secrets
   distrohop restore workstation                 # checkbox picker
   distrohop restore workstation --yes           # defaults, no prompt
+  distrohop restore workstation --pull          # download from S3/R2 first
   distrohop restore workstation --up
   distrohop clone workstation --gh
   distrohop prune --keep 5
@@ -821,6 +825,12 @@ cmd_backup() {
   fi
 
   ok "copied $copied items  $(du -sh "$dest" | awk '{print $1}')"
+
+  if (( WANT_PUSH )); then
+    declare -F s3_push_dir >/dev/null || die "s3 push unavailable (lib/s3.sh missing)"
+    s3_push_dir "$dest"
+  fi
+
   printf '\n%sNext%s\n' "$C_BOLD" "$C_RESET"
   printf '  restore:   distrohop restore %s\n' "$name"
   printf '  portable:  %s packages\n' "$(wc -l < "$dest/packages/portable.txt")"
@@ -913,6 +923,13 @@ cmd_show() {
 
 cmd_restore() {
   local snap
+
+  if (( WANT_PULL )); then
+    [[ -n ${1:-} ]] || die "usage: distrohop restore NAME --pull"
+    declare -F cmd_s3_pull >/dev/null || die "s3 pull unavailable (lib/s3.sh missing)"
+    cmd_s3_pull "$1"
+  fi
+
   snap=$(resolve_snapshot "${1:-}")
   ensure_manifest
 
@@ -1265,6 +1282,8 @@ while [[ $# -gt 0 ]]; do
     --yes|-y) WANT_YES=1; shift ;;
     --portable) PORTABLE=1; shift ;;
     --no-verify) WANT_NO_VERIFY=1; shift ;;
+    --push) WANT_PUSH=1; shift ;;
+    --pull) WANT_PULL=1; shift ;;
     --name) NAME_OVERRIDE=${2:?}; shift 2 ;;
     --dest) DEST_OVERRIDE=${2:?}; shift 2 ;;
     --groups) GROUPS_OVERRIDE=${2:?}; shift 2 ;;

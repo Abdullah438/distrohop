@@ -115,6 +115,29 @@ cmd_s3_configure() {
   info "objects land at r2:$(s3_remote_path '<name>')"
 }
 
+# Push an already-existing snapshot directory to S3/R2 as-is (no re-backup,
+# no forced secrets — used by both `s3 push SNAPSHOT` and `backup --push`).
+s3_push_dir() {
+  local snap=$1
+  [[ -d $snap ]] || die "snapshot not found: $snap"
+  s3_rclone_env
+  local name dest
+  name=$(basename "$snap")
+  dest="r2:$(s3_remote_path "$name")"
+  info "s3 push  $snap  →  $dest"
+  if (( DRY_RUN )); then
+    rclone copy "$snap" "$dest" --dry-run -P
+    return 0
+  fi
+  rclone copy "$snap" "$dest" -P --s3-no-check-bucket
+  if (( ! WANT_NO_VERIFY )); then
+    info "verifying upload"
+    rclone check "$snap" "$dest" --one-way || die "verification FAILED for $name — re-run: distrohop s3 push $name"
+  fi
+  ok "uploaded $name  ($(du -sh "$snap" | awk '{print $1}'))"
+  info "pull later with:  distrohop s3 pull $name"
+}
+
 cmd_s3_push() {
   local snap_arg=${1:-}
   local snap
@@ -134,22 +157,7 @@ cmd_s3_push() {
     s3_pack_secrets "$snap"
   fi
 
-  s3_rclone_env
-  local name dest
-  name=$(basename "$snap")
-  dest="r2:$(s3_remote_path "$name")"
-  info "s3 push  $snap  →  $dest"
-  if (( DRY_RUN )); then
-    rclone copy "$snap" "$dest" --dry-run -P
-    return 0
-  fi
-  rclone copy "$snap" "$dest" -P --s3-no-check-bucket
-  if (( ! WANT_NO_VERIFY )); then
-    info "verifying upload"
-    rclone check "$snap" "$dest" --one-way || die "verification FAILED for $name — re-run: distrohop s3 push $name"
-  fi
-  ok "uploaded $name  ($(du -sh "$snap" | awk '{print $1}'))"
-  info "pull later with:  distrohop s3 pull $name"
+  s3_push_dir "$snap"
 }
 
 cmd_s3_pull() {

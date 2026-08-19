@@ -33,9 +33,12 @@ distrohop config set dev_root ~/Projects
 distrohop status
 distrohop backup --name workstation
 distrohop backup --name workstation --secrets --archive
+distrohop backup --name workstation --secrets --push  # backup, then upload to S3/R2
 ```
 
 Default groups are `core apps gtk editor packages dev`. Secrets are opt-in (`--secrets`). Containers that touch the backed-up docker volumes or data dirs are stopped before the copy and started again right after, so the copies are consistent.
+
+`--push` uploads the snapshot to S3/R2 right after it's written (same as running `distrohop s3 push NAME` afterward) — see [S3 / Cloudflare R2](#s3--cloudflare-r2) for setup. It does not force `--secrets`; only what you told `backup` to include gets uploaded.
 
 Your dev tree's git trees are never copied. The snapshot records each GitHub remote and folder (e.g. `Fullstack/myapp`, `Python/mylib`, …) plus a `clone-dev.sh` that rebuilds the tree.
 
@@ -56,6 +59,7 @@ distrohop install
 distrohop restore workstation               # checkbox picker
 distrohop restore workstation --yes         # defaults, no prompt
 distrohop restore workstation --up          # then docker compose / supabase / pm2
+distrohop restore workstation --pull        # download from S3/R2 first, then restore
 distrohop clone workstation                 # only rebuild ~/Dev from GitHub
 distrohop bootstrap                         # zsh, p10k, plugins, fonts
 distrohop packages apply --portable
@@ -85,6 +89,8 @@ mkdir -p ~/.config/distrohop
 # put s3.conf there (chmod 600)
 distrohop s3 pull workstation
 distrohop restore workstation --gh
+# equivalent to the two commands above:
+distrohop restore workstation --pull --gh
 ```
 
 Keys can be imported from any `.env` file with `R2_ACCOUNT_ID` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` set (`distrohop s3 configure ENVFILE`). The bucket is always **`distrohop`** — create that in the R2 dashboard.
