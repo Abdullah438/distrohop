@@ -77,15 +77,29 @@ HOME="$H" XDG_CONFIG_HOME="$H/.config" DISTROHOP_DIR="$LEGACY_DIR" \
 assert_file "$LEGACY_DIR/legacy/files/.zshrc"
 
 # ---------------------------------------------------------------------------
-it "still reads ~/.config/distrohop when ~/.config/keepsake is absent"
+it "moves ~/.config/distrohop to ~/.config/keepsake"
 # ---------------------------------------------------------------------------
 HLEG=$(new_home hlegacy)
 mkdir -p "$HLEG/.config/distrohop"
 printf 'dev_root=/tmp/from-legacy-config\n' > "$HLEG/.config/distrohop/settings.conf"
 GOT=$(HOME="$HLEG" XDG_CONFIG_HOME="$HLEG/.config" KEEPSAKE_DIR="$SANDBOX/snapshots" \
         "$KEEPSAKE" config get dev_root)
-assert "[[ \$GOT == /tmp/from-legacy-config ]]" "config get reads the old distrohop settings.conf"
-assert_no "$HLEG/.config/keepsake"
+assert "[[ \$GOT == /tmp/from-legacy-config ]]" "config get still works after the move"
+assert_dir "$HLEG/.config/keepsake"
+assert_file "$HLEG/.config/keepsake/settings.conf"
+assert_no "$HLEG/.config/distrohop"
+
+# ---------------------------------------------------------------------------
+it "moves ~/Backups/distrohop to ~/Backups/keepsake and lists those snapshots"
+# ---------------------------------------------------------------------------
+HM=$(new_home hmig)
+mkdir -p "$HM/Backups/distrohop/oldsnap/files" "$HM/Backups/distrohop/oldsnap/meta"
+printf '2026-08-01T00:00:00+00:00\n' > "$HM/Backups/distrohop/oldsnap/meta/date"
+MIGOUT=$(HOME="$HM" XDG_CONFIG_HOME="$HM/.config" "$KEEPSAKE" list 2>&1)
+assert_dir "$HM/Backups/keepsake/oldsnap"
+assert_no "$HM/Backups/distrohop"
+assert "grep -q oldsnap <<< \"\$MIGOUT\"" "list shows the moved snapshot"
+assert "grep -q 'Backups/keepsake' <<< \"\$(HOME=\"\$HM\" XDG_CONFIG_HOME=\"\$HM/.config\" \"\$KEEPSAKE\" -h)\"" "help names the keepsake backup dir"
 
 # ---------------------------------------------------------------------------
 it "install links keepsake and a distrohop alias"

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-keepsake is a single bash CLI (`./keepsake`) that snapshots configs, packages, and dev-environment state, then restores them. Community tool (public GitHub repo), not a personal script — treat README/UX/error messages as user-facing. It is not a dotfiles symlink manager (it copies, never symlinks) and doesn't image whole systems. New installs use `~/.config/keepsake` and `~/Backups/keepsake`; if only the old `distrohop` paths exist, those are used instead. `DISTROHOP_DIR` / `DISTROHOP_DEV` still work as aliases of `KEEPSAKE_DIR` / `KEEPSAKE_DEV`.
+keepsake is a single bash CLI (`./keepsake`) that snapshots configs, packages, and dev-environment state, then restores them. Community tool (public GitHub repo), not a personal script — treat README/UX/error messages as user-facing. It is not a dotfiles symlink manager (it copies, never symlinks) and doesn't image whole systems. New installs use `~/.config/keepsake` and `~/Backups/keepsake`. On first run, if only the old `distrohop` paths exist, they are renamed. `DISTROHOP_DIR` / `DISTROHOP_DEV` still work as aliases of `KEEPSAKE_DIR` / `KEEPSAKE_DEV`.
 
 ## Running / testing
 
