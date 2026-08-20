@@ -13,27 +13,13 @@ done
 SCRIPT_DIR=$(cd "$(dirname "$SOURCE")" && pwd)
 unset _dir SOURCE
 
-# Prefer the new paths. If this is an upgrade from distrohop and only the
-# old config / snapshot dir exists, keep using it so s3.conf and snapshots
-# don't vanish under a new name.
 _cfg_root="${XDG_CONFIG_HOME:-$HOME/.config}"
-if [[ -d $_cfg_root/keepsake ]]; then
-  CONFIG_DIR="$_cfg_root/keepsake"
-elif [[ -d $_cfg_root/distrohop ]]; then
-  CONFIG_DIR="$_cfg_root/distrohop"
-else
-  CONFIG_DIR="$_cfg_root/keepsake"
-fi
-unset _cfg_root
+CONFIG_DIR="$_cfg_root/keepsake"
 
 if [[ -n ${KEEPSAKE_DIR:-} ]]; then
   DATA_DIR=$KEEPSAKE_DIR
 elif [[ -n ${DISTROHOP_DIR:-} ]]; then
   DATA_DIR=$DISTROHOP_DIR
-elif [[ -d $HOME/Backups/keepsake ]]; then
-  DATA_DIR=$HOME/Backups/keepsake
-elif [[ -d $HOME/Backups/distrohop ]]; then
-  DATA_DIR=$HOME/Backups/distrohop
 else
   DATA_DIR=$HOME/Backups/keepsake
 fi
@@ -84,6 +70,22 @@ info() { printf '%s%s%s %s\n' "$C_BLU" "→" "$C_RESET" "$*"; }
 warn() { printf '%s%s%s %s\n' "$C_YEL" "!" "$C_RESET" "$*" >&2; }
 err()  { printf '%s%s%s %s\n' "$C_RED" "✖" "$C_RESET" "$*" >&2; }
 die()  { err "$*"; exit 1; }
+
+# One-time rename from distrohop. Must run before lib/ is sourced so s3.conf
+# and the manifest are read from the new location.
+if [[ ! -e $_cfg_root/keepsake && -d $_cfg_root/distrohop ]]; then
+  mv "$_cfg_root/distrohop" "$_cfg_root/keepsake" \
+    || die "couldn't move $_cfg_root/distrohop → $CONFIG_DIR"
+  printf '%s%s%s %s\n' "$C_BLU" "→" "$C_RESET" "moved config $_cfg_root/distrohop → $CONFIG_DIR" >&2
+fi
+if [[ -z ${KEEPSAKE_DIR:-} && -z ${DISTROHOP_DIR:-} \
+      && ! -e $HOME/Backups/keepsake && -d $HOME/Backups/distrohop ]]; then
+  mkdir -p "$HOME/Backups"
+  mv "$HOME/Backups/distrohop" "$HOME/Backups/keepsake" \
+    || die "couldn't move $HOME/Backups/distrohop → $DATA_DIR"
+  info "moved snapshots $HOME/Backups/distrohop → $DATA_DIR" >&2
+fi
+unset _cfg_root
 
 usage() {
   cat <<EOF
