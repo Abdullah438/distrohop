@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+      - name: Syntax check
+        run: bash -n distrohop lib/*.sh tests/smoke.sh
+      - name: Lint
+        run: shellcheck -S warning distrohop lib/*.sh tests/smoke.sh
+
+  smoke:
+    name: smoke (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install runtime deps
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq rsync
+      - name: Run smoke tests
+        run: tests/smoke.sh
+
+  distros:
+    name: smoke (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: arch,       image: "archlinux:latest",       install: "pacman -Sy --noconfirm bash rsync tar coreutils findutils gzip diffutils" }
+          - { name: fedora,     image: "fedora:latest",          install: "dnf install -y bash rsync tar coreutils findutils gzip diffutils" }
+          - { name: debian,     image: "debian:stable-slim",     install: "apt-get update -qq && apt-get install -y -qq bash rsync tar coreutils findutils gzip diffutils" }
+          - { name: opensuse,   image: "opensuse/tumbleweed",    install: "zypper --non-interactive install bash rsync tar coreutils findutils gzip diffutils" }
+    steps:
+      - name: Install runtime deps
+        run: ${{ matrix.install }}
+      - uses: actions/checkout@v4
+      # Each of these exercises a different pm.sh branch (pacman/dnf/apt/zypper)
+      # during the package dump that every backup performs.
+      - name: Run smoke tests
+        run: tests/smoke.sh

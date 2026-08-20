@@ -1,18 +1,23 @@
+# shellcheck shell=bash
 # sourced by distrohop — S3 / Cloudflare R2 push and pull of full snapshots
 
 S3_CONF="${S3_CONF:-$CONFIG_DIR/s3.conf}"
 
 s3_load_conf() {
-  conf_load_kv "$S3_CONF" endpoint bucket prefix access_key secret_key region || return 1
+  conf_load_kv "$S3_CONF" endpoint bucket prefix access_key secret_key region password || return 1
   [[ -n ${endpoint:-} && -n ${bucket:-} && -n ${access_key:-} && -n ${secret_key:-} ]]
 }
+
+# Snapshots are encrypted client-side whenever s3.conf carries a password.
+# Without one, everything below behaves exactly as it did before.
+s3_encrypted() { [[ -n ${password:-} ]]; }
 
 s3_import_env() {
   local envfile=$1
   [[ -n $envfile ]] || die "usage: distrohop s3 configure ENVFILE"
   [[ -f $envfile ]] || die "no env file at $envfile"
   python3 - "$envfile" "$S3_CONF" <<'PY'
-import re, sys
+import secrets, sys
 from pathlib import Path
 src, dest = Path(sys.argv[1]), Path(sys.argv[2])
 vals = {}
@@ -27,6 +32,16 @@ missing = [k for k in need if not vals.get(k)]
 if missing:
     sys.exit("missing in %s: %s" % (src, ", ".join(missing)))
 account = vals["R2_ACCOUNT_ID"]
+# Reuse an existing password if this config is being regenerated — rotating it
+# would strand every snapshot already in the bucket.
+password = ""
+if dest.exists():
+    for line in dest.read_text().splitlines():
+        if line.startswith("password="):
+            password = line.split("=", 1)[1].strip().strip("\"'")
+fresh = not password
+if fresh:
+    password = secrets.token_urlsafe(32)
 dest.parent.mkdir(parents=True, exist_ok=True)
 dest.write_text(
     "# generated from %s — do not commit\n"
@@ -36,10 +51,13 @@ dest.write_text(
     "access_key=%s\n"
     "secret_key=%s\n"
     "region=auto\n"
-    % (src, account, vals["R2_ACCESS_KEY_ID"], vals["R2_SECRET_ACCESS_KEY"])
+    "# Snapshot contents are encrypted with this before upload. Empty = no\n"
+    "# encryption. Lose it and every snapshot in the bucket is unreadable.\n"
+    "password=%s\n"
+    % (src, account, vals["R2_ACCESS_KEY_ID"], vals["R2_SECRET_ACCESS_KEY"], password)
 )
 dest.chmod(0o600)
-print(dest)
+print("fresh-password" if fresh else "kept-password")
 PY
 }
 
@@ -77,6 +95,50 @@ s3_rclone_env() {
   export RCLONE_CONFIG_R2_REGION=${region:-auto}
   export RCLONE_CONFIG_R2_ACL=private
   export RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true
+
+  s3_encrypted || return 0
+
+  # Layer rclone's own crypt over the S3 remote so file *contents* are
+  # encrypted before they leave this machine — ssh keys, .env files, db dumps
+  # and rclone.conf never sit in the bucket as plaintext.
+  #
+  # Names are deliberately left readable (filename_encryption=off,
+  # directory_name_encryption=false, suffix=none): `s3 ls`, `s3 prune`,
+  # `delete` and the S3 column in `list` all work off object names, and
+  # scrambling them buys little when the contents are already sealed.
+  local obscured
+  obscured=$(rclone obscure "$password" 2>/dev/null) \
+    || die "rclone obscure failed — cannot set up encryption"
+  export RCLONE_CONFIG_R2CRYPT_TYPE=crypt
+  local crypt_root
+  crypt_root="r2:$(s3_remote_path '')"
+  export RCLONE_CONFIG_R2CRYPT_REMOTE=$crypt_root
+  export RCLONE_CONFIG_R2CRYPT_PASSWORD=$obscured
+  export RCLONE_CONFIG_R2CRYPT_FILENAME_ENCRYPTION=off
+  export RCLONE_CONFIG_R2CRYPT_DIRECTORY_NAME_ENCRYPTION=false
+  export RCLONE_CONFIG_R2CRYPT_SUFFIX=none
+}
+
+# Remote spec to read/write a snapshot's *data* through. Listing, purging and
+# existence checks stay on plain "r2:" — object names are readable either way.
+s3_data_remote() {
+  local name=$1
+  if s3_encrypted; then
+    printf 'r2crypt:%s' "$name"
+  else
+    printf 'r2:%s' "$(s3_remote_path "$name")"
+  fi
+}
+
+# rclone check can't compare hashes through a crypt remote; cryptcheck is the
+# equivalent that can. Args: LOCAL_DIR NAME [extra rclone args...]
+s3_verify() {
+  local local_dir=$1 name=$2; shift 2
+  if s3_encrypted; then
+    rclone cryptcheck "$local_dir" "r2crypt:$name" "$@"
+  else
+    rclone check "$local_dir" "r2:$(s3_remote_path "$name")" "$@"
+  fi
 }
 
 # Make sure the snapshot on disk includes secrets/ before upload.
@@ -99,7 +161,12 @@ cmd_s3_configure() {
   local from=${1:-}
   mkdir -p "$CONFIG_DIR"
   if [[ -n $from ]]; then
-    s3_import_env "$from"
+    local result
+    result=$(s3_import_env "$from")
+    if [[ $result == fresh-password ]]; then
+      warn "generated an encryption password in $S3_CONF"
+      warn "back that file up offline (1Password, USB) — without it the snapshots in the bucket cannot be decrypted"
+    fi
   else
     local example="$SCRIPT_DIR/s3.conf.example"
     [[ -f $example ]] || die "missing $example"
@@ -113,6 +180,11 @@ cmd_s3_configure() {
   s3_load_conf || die "config incomplete"
   ok "wrote $S3_CONF  (bucket=$bucket prefix=${prefix:-<none>})"
   info "objects land at r2:$(s3_remote_path '<name>')"
+  if s3_encrypted; then
+    info "snapshot contents are encrypted before upload (names stay readable)"
+  else
+    warn "password= is empty — snapshots will upload unencrypted"
+  fi
 }
 
 # Push an already-existing snapshot directory to S3/R2 as-is (no re-backup,
@@ -123,8 +195,13 @@ s3_push_dir() {
   s3_rclone_env
   local name dest
   name=$(basename "$snap")
-  dest="r2:$(s3_remote_path "$name")"
-  info "s3 push  $snap  →  $dest"
+  dest=$(s3_data_remote "$name")
+  if s3_encrypted; then
+    info "s3 push  $snap  →  r2:$(s3_remote_path "$name")  ${C_DIM}(encrypted)${C_RESET}"
+  else
+    info "s3 push  $snap  →  $dest"
+    warn "uploading unencrypted — set password= in $S3_CONF to encrypt snapshots client-side"
+  fi
   if (( DRY_RUN )); then
     rclone copy "$snap" "$dest" --dry-run -P
     return 0
@@ -132,7 +209,7 @@ s3_push_dir() {
   rclone copy "$snap" "$dest" -P --s3-no-check-bucket
   if (( ! WANT_NO_VERIFY )); then
     info "verifying upload"
-    rclone check "$snap" "$dest" --one-way || die "verification FAILED for $name — re-run: distrohop s3 push $name"
+    s3_verify "$snap" "$name" --one-way || die "verification FAILED for $name — re-run: distrohop s3 push $name"
   fi
   ok "uploaded $name  ($(du -sh "$snap" | awk '{print $1}'))"
   info "pull later with:  distrohop s3 pull $name"
@@ -144,17 +221,23 @@ cmd_s3_push() {
   if [[ -n $snap_arg ]]; then
     snap=$(resolve_snapshot "$snap_arg")
   else
-    # full backup including secrets, then upload
-    WANT_SECRETS=1
     [[ -n $NAME_OVERRIDE ]] || NAME_OVERRIDE="workstation-$(date +%Y-%m-%d_%H%M%S)"
     cmd_backup
     snap="${DEST_OVERRIDE:-$DATA_DIR}/$NAME_OVERRIDE"
   fi
   [[ -d $snap ]] || die "snapshot not found"
 
-  if (( ! DRY_RUN )); then
-    info "including secrets in the upload"
-    s3_pack_secrets "$snap"
+  # Secrets are opt-in here for the same reason they are on backup: pushing
+  # must never add ssh keys / gh hosts / rclone.conf to a snapshot that was
+  # deliberately taken without them. --secrets adds them (and rewrites the
+  # on-disk snapshot to match what gets uploaded).
+  if (( WANT_SECRETS )); then
+    if (( ! DRY_RUN )); then
+      info "adding secrets to $(basename "$snap") before upload"
+      s3_pack_secrets "$snap"
+    fi
+  elif [[ ! -d $snap/secrets ]]; then
+    warn "no secrets in this snapshot — include them with: distrohop s3 push $(basename "$snap") --secrets"
   fi
 
   s3_push_dir "$snap"
@@ -177,15 +260,38 @@ cmd_s3_pull() {
       fi
     fi
   fi
-  info "s3 pull  ${src}  →  $dest"
+  # A legacy double-prefixed key predates encryption support, so it is always
+  # read through the plain remote.
+  local from legacy=0
+  [[ $src == "$(s3_remote_path "$name")" ]] || legacy=1
+  if (( legacy )) || ! s3_encrypted; then
+    from="r2:${src}"
+  else
+    from="r2crypt:${name}"
+  fi
+
+  if s3_encrypted && (( ! legacy )); then
+    info "s3 pull  ${src}  →  $dest  ${C_DIM}(encrypted)${C_RESET}"
+  else
+    info "s3 pull  ${src}  →  $dest"
+  fi
   if (( DRY_RUN )); then
-    rclone copy "r2:${src}" "$dest" --dry-run -P
+    rclone copy "$from" "$dest" --dry-run -P
     return 0
   fi
-  rclone copy "r2:${src}" "$dest" -P --s3-no-check-bucket
+  rclone copy "$from" "$dest" -P --s3-no-check-bucket
   if (( ! WANT_NO_VERIFY )); then
     info "verifying download"
-    rclone check "r2:${src}" "$dest" --one-way || die "verification FAILED for $dest — re-run: distrohop s3 pull $name"
+    if (( legacy )) || ! s3_encrypted; then
+      rclone check "r2:${src}" "$dest" --one-way || die "verification FAILED for $dest — re-run: distrohop s3 pull $name"
+    else
+      s3_verify "$dest" "$name" || die "verification FAILED for $dest — re-run: distrohop s3 pull $name"
+    fi
+  fi
+  # Wrong password decrypts to noise rather than failing outright — say so
+  # here instead of letting restore choke on a garbled manifest.
+  if [[ -f $dest/meta/date ]] && ! date -d "$(head -n1 "$dest/meta/date")" +%s >/dev/null 2>&1; then
+    warn "$name/meta/date is unreadable — this snapshot may have been pushed with a different password (or none)"
   fi
   ok "pulled $dest"
 }
@@ -199,6 +305,16 @@ cmd_s3_ls() {
   rclone lsd "r2:${pfx}" 2>/dev/null || rclone ls "r2:${pfx}" | head -50
 }
 
+# When a remote snapshot was taken, as epoch seconds — read from the object
+# it already carries (meta/date). Prints 0 if that can't be read, which sorts
+# it oldest and makes it the first thing prune drops.
+s3_snapshot_epoch() {
+  local name=$1 when=""
+  when=$(rclone cat "$(s3_data_remote "$name")/meta/date" 2>/dev/null | head -n1 || true)
+  [[ -n $when ]] || { printf '0\n'; return 0; }
+  date -d "$when" +%s 2>/dev/null || printf '0\n'
+}
+
 cmd_s3_prune() {
   local keep=${KEEP_N:-$PRUNE_DEFAULT_KEEP}
   [[ $keep =~ ^[0-9]+$ ]] || die "--keep must be a non-negative integer"
@@ -207,10 +323,18 @@ cmd_s3_prune() {
   pfx=$(s3_remote_path "")
   pfx=${pfx%/}
 
+  # Order by each snapshot's recorded date, never by name — a custom --name
+  # is not time-sortable and name order would prune the wrong snapshots.
   local names=() n
-  while IFS= read -r n; do
-    [[ -n $n ]] && names+=("${n%/}")
-  done < <(rclone lsf "r2:${pfx}" --dirs-only 2>/dev/null | sort)
+  while IFS=$'\t' read -r _ n; do
+    [[ -n $n ]] && names+=("$n")
+  done < <(
+    while IFS= read -r n; do
+      n=${n%/}
+      [[ -n $n ]] || continue
+      printf '%s\t%s\n' "$(s3_snapshot_epoch "$n")" "$n"
+    done < <(rclone lsf "r2:${pfx}" --dirs-only 2>/dev/null) | sort -n -k1,1
+  )
   local total=${#names[@]}
   if (( total <= keep )); then
     info "$total remote snapshot(s), keeping $keep — nothing to prune"
@@ -243,6 +367,6 @@ cmd_s3() {
     pull)      cmd_s3_pull "${1:-}" ;;
     ls|list)   cmd_s3_ls ;;
     prune)     cmd_s3_prune ;;
-    *) die "usage: distrohop s3 configure|push|pull|ls|prune  [NAME]" ;;
+    *) die "usage: distrohop s3 configure|push|pull|ls|prune  [NAME]  [--secrets]" ;;
   esac
 }

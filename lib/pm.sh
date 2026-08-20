@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # sourced by distrohop — package-manager abstraction (pacman/dnf/apt/zypper)
 # shellcheck disable=SC2034
 

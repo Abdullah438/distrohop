@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # sourced by distrohop — ~/Dev inventory, clone map, envs, compose volumes
 # shellcheck disable=SC2034
 
@@ -165,24 +166,6 @@ dev_write_inventory() {
     dev_repos
   } > "$out/repos.tsv"
   write_clone_script "$out/clone-dev.sh"
-
-  # machine-readable copy for restore
-  python3 - "$out/repos.tsv" "$out/inventory.json" "$DEV_ROOT" <<'PY'
-import json, sys
-tsv, dest, root = sys.argv[1], sys.argv[2], sys.argv[3]
-repos = []
-with open(tsv, encoding="utf-8") as f:
-    for line in f:
-        line = line.rstrip("\n")
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split("\t")
-        rel = parts[0]
-        branch = parts[1] if len(parts) > 1 else ""
-        origin = parts[2] if len(parts) > 2 else ""
-        repos.append({"path": rel, "branch": branch, "origin": origin})
-json.dump({"dev_root": "Dev", "home_dev": root, "repos": repos}, open(dest, "w"), indent=2)
-PY
 }
 
 dev_backup_envs() {
@@ -466,7 +449,7 @@ dev_backup() {
   dev_backup_pm2 "$out"
 
   cat > "$out/.gitignore" <<'EOF'
-# Keep the clone map (repos.tsv, clone-dev.sh, inventory.json) in git.
+# Keep the clone map (repos.tsv, clone-dev.sh) in git.
 # These directories hold secrets and database dumps — do not push them
 # to a public remote. Fine in a private repo you accept the risk for.
 envs/

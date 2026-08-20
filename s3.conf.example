@@ -1,7 +1,7 @@
 # Copy to ~/.config/distrohop/s3.conf (chmod 600) or run:
 #   distrohop s3 configure ENVFILE
 # which imports R2_ACCOUNT_ID / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY from
-# any .env file you point it at.
+# any .env file you point it at, and generates an encryption password.
 #
 # Same S3 API works for Cloudflare R2, AWS, MinIO, etc.
 
@@ -12,3 +12,15 @@ prefix=
 access_key=
 secret_key=
 region=auto
+
+# Client-side encryption (rclone crypt). Snapshot *contents* are encrypted
+# before upload — ssh keys, .env files, database dumps and rclone.conf never
+# reach the bucket as plaintext. Snapshot and file names stay readable so
+# `s3 ls`, `s3 prune` and `delete` keep working.
+#
+# Leave empty to upload unencrypted. Changing it strands snapshots already in
+# the bucket, so set it once, then keep this file offline — it is the only
+# copy of the key.
+#
+#   password=$(head -c 32 /dev/urandom | base64)
+password=

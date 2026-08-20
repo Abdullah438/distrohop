@@ -2,7 +2,7 @@
 # distrohop — snapshot the configs that survive a distro hop, then put them back.
 set -euo pipefail
 
-VERSION="1.3.0"
+VERSION="1.4.0"
 
 SOURCE=${BASH_SOURCE[0]}
 while [[ -L $SOURCE ]]; do
@@ -51,7 +51,7 @@ if [[ -t 1 ]]; then
   C_BLU=$'\033[34m'
   C_CYN=$'\033[36m'
 else
-  C_RESET= C_BOLD= C_DIM= C_RED= C_GRN= C_YEL= C_BLU= C_CYN=
+  C_RESET='' C_BOLD='' C_DIM='' C_RED='' C_GRN='' C_YEL='' C_BLU='' C_CYN=''
 fi
 
 ok()   { printf '%s%s%s %s\n' "$C_GRN" "✔" "$C_RESET" "$*"; }
@@ -71,9 +71,10 @@ ${C_BOLD}USAGE${C_RESET}
   distrohop prune   [--keep N] [--dry-run]
   distrohop delete  NAME [--local-only|--s3-only] [--dry-run]   (alias: rm)
   distrohop clean   [--older-than DAYS] [--dry-run]
-  distrohop s3      configure ENVFILE | push [SNAPSHOT] [--no-verify] | pull NAME [--no-verify] | ls | prune [--keep N]
+  distrohop s3      configure ENVFILE | push [SNAPSHOT] [--secrets] [--no-verify] | pull NAME [--no-verify] | ls | prune [--keep N]
   distrohop list    (alias: ls)   — newest first, shows S3 push status if s3 is configured
   distrohop show    SNAPSHOT
+  distrohop verify  SNAPSHOT
   distrohop status  [--groups LIST]
   distrohop packages dump | apply [--portable] [--dry-run]
   distrohop bootstrap [--dry-run]
@@ -110,8 +111,10 @@ ${C_BOLD}EXAMPLES${C_RESET}
   distrohop delete workstation --local-only
   distrohop delete workstation --s3-only
   distrohop clean --older-than 30
-  distrohop s3 push workstation
+  distrohop s3 push workstation                 # upload as-is
+  distrohop s3 push workstation --secrets       # ...and add ssh keys / rclone.conf
   distrohop s3 pull workstation
+  distrohop verify workstation                  # checksum a local snapshot
   distrohop s3 prune --keep 5
   distrohop packages apply --portable
   distrohop bootstrap
@@ -311,6 +314,7 @@ item_exists() {
   [[ -e $p || -L $p ]]
 }
 
+# shellcheck disable=SC2088  # "~/..." here is display text, not a path
 copy_item() {
   local rel=$1 dest_root=$2
   local src="$HOME/$rel" dest="$dest_root/$rel"
@@ -343,7 +347,8 @@ restore_item() {
   fi
   mkdir -p "$(dirname "$dest")"
   if [[ -e $dest || -L $dest ]]; then
-    local bak="${dest}.pre-hop.$(date +%Y%m%d%H%M%S)"
+    local bak
+    bak="${dest}.pre-hop.$(date +%Y%m%d%H%M%S)"
     if [[ -d $dest && ! -L $dest ]]; then
       mkdir -p "$bak"
       rsync -a "$dest/" "$bak/"
@@ -548,6 +553,55 @@ write_meta() {
 }
 
 # ---------------------------------------------------------------------------
+# Snapshot integrity
+# ---------------------------------------------------------------------------
+
+# Hash every file in the finished snapshot so `distrohop verify` can answer
+# "is this snapshot still intact?" without a network round-trip. Skipped by
+# --no-verify, and never fatal — a snapshot without SHA256SUMS is still a
+# usable snapshot.
+write_checksums() {
+  local snap=$1
+  (( WANT_NO_VERIFY )) && return 0
+  if ! command -v sha256sum >/dev/null 2>&1; then
+    warn "sha256sum not found — snapshot written without SHA256SUMS"
+    return 0
+  fi
+  info "checksumming snapshot"
+  if ( cd "$snap" \
+        && find . -type f ! -name SHA256SUMS ! -name 'SHA256SUMS.tmp' -print0 \
+           | sort -z \
+           | xargs -0 -r sha256sum > SHA256SUMS.tmp ) 2>/dev/null; then
+    mv "$snap/SHA256SUMS.tmp" "$snap/SHA256SUMS"
+  else
+    rm -f "$snap/SHA256SUMS.tmp"
+    warn "could not checksum every file — snapshot written without SHA256SUMS"
+  fi
+}
+
+cmd_verify() {
+  local snap
+  snap=$(resolve_snapshot "${1:-}")
+  local name; name=$(basename "$snap")
+  [[ -f $snap/SHA256SUMS ]] || \
+    die "no SHA256SUMS in $name — it predates checksums, or was written with --no-verify"
+  command -v sha256sum >/dev/null 2>&1 || die "sha256sum not found"
+
+  local total
+  total=$(grep -c . < "$snap/SHA256SUMS" || true)
+  info "verifying $name ($total files)"
+
+  local out rc=0
+  out=$( cd "$snap" && sha256sum --quiet -c SHA256SUMS 2>&1 ) || rc=$?
+  if (( rc == 0 )); then
+    ok "$name verified — $total files match"
+    return 0
+  fi
+  printf '%s\n' "$out" >&2
+  die "$name FAILED verification (see above) — re-pull it, or take a fresh backup"
+}
+
+# ---------------------------------------------------------------------------
 # Cleanup of *.pre-hop.* leftovers from past restores
 # ---------------------------------------------------------------------------
 
@@ -669,7 +723,7 @@ cmd_install() {
   ensure_manifest
   ok "linked $dest → $SCRIPT_DIR/distrohop"
   if [[ :$PATH: != *":$HOME/.local/bin:"* ]]; then
-    warn "~/.local/bin is not on PATH — add it, or open a new terminal"
+    warn "$HOME/.local/bin is not on PATH — add it, or open a new terminal"
   fi
 }
 
@@ -707,12 +761,13 @@ cmd_edit() {
   exec "$editor" "$MANIFEST"
 }
 
+# shellcheck disable=SC2088  # "~/..." here is display text, not a path
 cmd_status() {
   ensure_manifest
   printf '%sWhat would be copied%s  groups: %s%s%s\n\n' \
     "$C_BOLD" "$C_RESET" "$C_CYN" "$(active_groups | tr '\n' ' ')" "$C_RESET"
 
-  local g rel src bytes=0 count=0 missing=0
+  local g rel src count=0 missing=0
   for g in "${ALL_FILE_GROUPS[@]}"; do
     group_wanted "$g" || continue
     local shown=0
@@ -760,11 +815,10 @@ cmd_status() {
 
 cmd_backup() {
   ensure_manifest
-  mkdir -p "${DEST_OVERRIDE:-$DATA_DIR}"
 
   local stamp host name dest
   stamp=$(date +%Y-%m-%d_%H%M%S)
-  host=$(hostname -s 2>/dev/null || hostname)
+  host=$(hostname -s 2>/dev/null || hostname 2>/dev/null || printf '%s' "${HOSTNAME:-unknown}")
   name=${NAME_OVERRIDE:-${stamp}_${host}}
   dest="${DEST_OVERRIDE:-$DATA_DIR}/$name"
 
@@ -784,7 +838,7 @@ cmd_backup() {
   write_meta "$dest"
   dump_packages "$dest/packages"
   if declare -F devapps_backup >/dev/null; then
-    devapps_backup "$dest"
+    devapps_backup "$dest" || warn "dev-apps inventory failed — the rest of the snapshot is still being written"
   fi
   write_notes "$dest"
 
@@ -812,11 +866,15 @@ cmd_backup() {
       fi
     done < <(parse_manifest secrets)
     chmod -R go= "$dest/secrets" 2>/dev/null || true
+    # the snapshot root too — secrets/ is only as private as its parent
+    chmod go= "$dest" 2>/dev/null || true
   fi
 
   if group_wanted dev && declare -F dev_backup >/dev/null; then
-    dev_backup "$dest"
+    dev_backup "$dest" || warn "dev group backup had errors — the rest of the snapshot is intact"
   fi
+
+  write_checksums "$dest"
 
   if (( WANT_ARCHIVE )); then
     local archive="${dest}.tar.zst"
@@ -826,6 +884,11 @@ cmd_backup() {
     else
       archive="${dest}.tar.xz"
       tar -C "$(dirname "$dest")" -cJf "$archive" "$(basename "$dest")"
+    fi
+    # tar honours umask, so an archive of a snapshot containing private keys
+    # would otherwise land at 0644.
+    if [[ -d $dest/secrets ]]; then
+      chmod 600 "$archive" 2>/dev/null || true
     fi
     ok "archive $(du -sh "$archive" | awk '{print $1}')  $archive"
   fi
@@ -848,18 +911,35 @@ cmd_backup() {
   fi
 }
 
-# Snapshot directories under $1 (default: active data dir), oldest-first —
-# names are lexicographically time-sortable (YYYY-MM-DD_HHMMSS_host or a
-# custom --name), and bash glob expansion is already lexicographic.
+# Snapshot directories under $1 (default: active data dir), oldest-first.
+# Prints: epoch<TAB>when<TAB>path
+#
+# Ordering comes from the recorded snapshot date (meta/date), falling back to
+# the directory mtime. NEVER sort these by name: a custom --name (e.g.
+# "workstation") is not time-sortable, and name order would make prune delete
+# newer snapshots while keeping older ones.
 list_snapshot_dirs() {
-  local dir=${1:-${DEST_OVERRIDE:-$DATA_DIR}} d
+  local dir=${1:-${DEST_OVERRIDE:-$DATA_DIR}} d when epoch
   [[ -d $dir ]] || return 0
   shopt -s nullglob
   for d in "$dir"/*/; do
+    d=${d%/}
     [[ -d $d/files || -d $d/meta ]] || continue
-    printf '%s\n' "${d%/}"
-  done
+    when=$(cat "$d/meta/date" 2>/dev/null || true)
+    epoch=""
+    [[ -n $when ]] && epoch=$(date -d "$when" +%s 2>/dev/null || true)
+    if [[ -z $epoch ]]; then
+      epoch=$(stat -c %Y "$d" 2>/dev/null || echo 0)
+      [[ -n $when ]] || when=$(date -Iseconds -d "@$epoch" 2>/dev/null || echo unknown)
+    fi
+    printf '%s\t%s\t%s\n' "$epoch" "$when" "$d"
+  done | sort -n -k1,1
   shopt -u nullglob
+}
+
+# Newest snapshot by recorded date (not by name). Empty if there is none.
+latest_snapshot_dir() {
+  list_snapshot_dirs | tail -n1 | cut -f3
 }
 
 cmd_list() {
@@ -870,10 +950,9 @@ cmd_list() {
   fi
 
   local -a entries=()
-  local d when
-  while IFS= read -r d; do
-    when=$(cat "$d/meta/date" 2>/dev/null || echo "")
-    entries+=("${when:-0000-00-00T00:00:00}"$'\t'"$d")
+  local epoch d when
+  while IFS=$'\t' read -r epoch when d; do
+    entries+=("$when"$'\t'"$d")
   done < <(list_snapshot_dirs "$dir")
 
   if (( ${#entries[@]} == 0 )); then
@@ -921,7 +1000,7 @@ cmd_list() {
     else
       printf '%-28s %8s  %s\n' "$name" "$size" "$when"
     fi
-  done < <(printf '%s\n' "${entries[@]}" | sort -t $'\t' -k1,1 -r)
+  done < <(printf '%s\n' "${entries[@]}" | tac)
 }
 
 cmd_prune() {
@@ -933,8 +1012,8 @@ cmd_prune() {
     return 0
   fi
 
-  local snaps=()
-  while IFS= read -r d; do snaps+=("$d"); done < <(list_snapshot_dirs "$dir")
+  local snaps=() epoch when d
+  while IFS=$'\t' read -r epoch when d; do snaps+=("$d"); done < <(list_snapshot_dirs "$dir")
   local total=${#snaps[@]}
   if (( total <= keep )); then
     info "$total snapshot(s), keeping $keep — nothing to prune"
@@ -999,7 +1078,8 @@ cmd_delete() {
   if (( do_s3 )); then
     if declare -F s3_load_conf >/dev/null && s3_load_conf 2>/dev/null; then
       s3_rclone_env
-      local remote="r2:$(s3_remote_path "$name")"
+      local remote
+      remote="r2:$(s3_remote_path "$name")"
       if rclone lsf "$remote" --max-depth 1 2>/dev/null | grep -q .; then
         found=1
         if (( DRY_RUN )); then
@@ -1091,7 +1171,7 @@ cmd_restore() {
   fi
 
   if declare -F dev_restore >/dev/null; then
-    dev_restore "$snap"
+    dev_restore "$snap" || warn "dev group restore had errors — continuing with the rest"
   fi
 
   if restore_wanted packages; then
@@ -1099,7 +1179,7 @@ cmd_restore() {
   fi
 
   if restore_wanted dev-apps && declare -F devapps_restore >/dev/null; then
-    devapps_restore "$snap"
+    devapps_restore "$snap" || warn "dev-apps restore had errors — continuing with the rest"
   fi
 
   if (( ! DRY_RUN )); then
@@ -1119,7 +1199,7 @@ cmd_clone() {
   if [[ -n ${1:-} ]]; then
     snap=$(resolve_snapshot "$1")
   else
-    snap=$(ls -1d "${DEST_OVERRIDE:-$DATA_DIR}"/*/ 2>/dev/null | tail -n1 || true)
+    snap=$(latest_snapshot_dir)
     [[ -n $snap ]] || die "no snapshot found — pass one: distrohop clone workstation"
   fi
   [[ -x $snap/dev/clone-dev.sh ]] || die "no clone map in $snap (backup with the dev group)"
@@ -1131,7 +1211,8 @@ cmd_clone() {
 }
 
 cmd_packages_dump() {
-  local out="${DEST_OVERRIDE:-$DATA_DIR}/packages-$(date +%Y-%m-%d)"
+  local out
+  out="${DEST_OVERRIDE:-$DATA_DIR}/packages-$(date +%Y-%m-%d)"
   mkdir -p "$out"
   dump_packages "$out"
   ok "wrote package lists → $out"
@@ -1148,7 +1229,7 @@ cmd_packages_apply() {
   if [[ -n ${2:-} ]]; then
     snap_dir=$(resolve_snapshot "$2")
   else
-    snap_dir=$(ls -1d "${DEST_OVERRIDE:-$DATA_DIR}"/*/ 2>/dev/null | tail -n1 || true)
+    snap_dir=$(latest_snapshot_dir)
   fi
   [[ -n $snap_dir && -d $snap_dir/packages ]] || die "no snapshot package lists found — run backup first"
 
@@ -1426,6 +1507,10 @@ case $cmd in
   show)
     [[ $# -ge 1 ]] || die "usage: distrohop show SNAPSHOT"
     cmd_show "$1"
+    ;;
+  verify)
+    [[ $# -ge 1 ]] || die "usage: distrohop verify SNAPSHOT"
+    cmd_verify "$1"
     ;;
   restore)
     [[ $# -ge 1 ]] || die "usage: distrohop restore SNAPSHOT"
