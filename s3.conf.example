@@ -1,13 +1,15 @@
-# Copy to ~/.config/distrohop/s3.conf (chmod 600) or run:
-#   distrohop s3 configure ENVFILE
+# Copy to ~/.config/keepsake/s3.conf (chmod 600) or run:
+#   keepsake s3 configure ENVFILE
 # which imports R2_ACCOUNT_ID / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY from
 # any .env file you point it at, and generates an encryption password.
 #
 # Same S3 API works for Cloudflare R2, AWS, MinIO, etc.
 
 endpoint=https://<ACCOUNT_ID>.r2.cloudflarestorage.com
-bucket=distrohop
-# Leave empty so snapshots sit at bucket/<name>, not bucket/distrohop/<name>
+# Default for new configs. If you already have an R2 bucket named distrohop,
+# keep using that (`s3 configure` will preserve it).
+bucket=keepsake
+# Leave empty so snapshots sit at bucket/<name>, not bucket/keepsake/<name>
 prefix=
 access_key=
 secret_key=

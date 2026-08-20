@@ -1,0 +1,10 @@
+[Unit]
+Description=keepsake backup (--secrets --push)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:%h/.local/bin
+ExecStart=/usr/bin/bash -c '%h/.local/bin/keepsake backup --name "$(hostname -s)_$(date +%%Y%%m%%d_%%H%%M%%S)" --secrets --push'
+Nice=10

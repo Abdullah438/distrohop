@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# sourced by distrohop — record and reinstall main development apps
+# sourced by keepsake — record and reinstall main development apps
 
 # id \t label \t detectors (a|b|c) \t packages \t extra-note
 devapps_catalog() {
@@ -192,9 +192,9 @@ PY
 import json, sys
 doc = json.load(open(sys.argv[1]))
 lines = [
-    "distrohop development apps",
+    "keepsake development apps",
     "==========================",
-    "AUTO  = distrohop will try pacman/AUR, dnf, or apt, then nvm / pyenv / npm",
+    "AUTO  = keepsake will try pacman/AUR, dnf, or apt, then nvm / pyenv / npm",
     "MANUAL = you still have a step (auth, SDK, group membership, website download)",
     "",
 ]

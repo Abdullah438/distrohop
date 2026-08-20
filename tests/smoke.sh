@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# distrohop smoke tests — end-to-end backup/restore against a throwaway $HOME.
+# keepsake smoke tests — end-to-end backup/restore against a throwaway $HOME.
 #
 #   tests/smoke.sh
 #
 # Nothing here touches your real home directory or your real snapshots: every
-# case runs with HOME, XDG_CONFIG_HOME and DISTROHOP_DIR pointed at a temp
+# case runs with HOME, XDG_CONFIG_HOME and KEEPSAKE_DIR pointed at a temp
 # tree that is removed on exit.
 
 # Assertions are eval'd, so shellcheck cannot see where these variables are read.
@@ -12,7 +12,7 @@
 set -uo pipefail
 
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-DISTROHOP="$REPO/distrohop"
+KEEPSAKE="$REPO/keepsake"
 
 PASS=0
 FAIL=0
@@ -30,7 +30,7 @@ assert_file() { [[ -f $1 ]] && pass "exists: ${1#"$SANDBOX/"}" || fail "missing 
 assert_dir()  { [[ -d $1 ]] && pass "exists: ${1#"$SANDBOX/"}" || fail "missing dir: $1"; }
 assert_no()   { [[ ! -e $1 ]] && pass "absent: ${1#"$SANDBOX/"}" || fail "should not exist: $1"; }
 
-SANDBOX=$(mktemp -d "${TMPDIR:-/tmp}/distrohop-smoke.XXXXXX")
+SANDBOX=$(mktemp -d "${TMPDIR:-/tmp}/keepsake-smoke.XXXXXX")
 trap 'rm -rf "$SANDBOX"' EXIT
 
 # A throwaway home with a few of the files the bundled manifest's [core]
@@ -47,40 +47,89 @@ new_home() {
   printf '%s\n' "$h"
 }
 
-# run HOME_DIR ARGS... — invoke distrohop fully sandboxed
+# run HOME_DIR ARGS... — invoke keepsake fully sandboxed
 run() {
   local home=$1; shift
   HOME="$home" \
   XDG_CONFIG_HOME="$home/.config" \
-  DISTROHOP_DIR="$SANDBOX/snapshots" \
-  DISTROHOP_DEV="$home/Dev" \
-    "$DISTROHOP" "$@"
+  KEEPSAKE_DIR="$SANDBOX/snapshots" \
+  KEEPSAKE_DEV="$home/Dev" \
+    "$KEEPSAKE" "$@"
 }
 
-printf '\ndistrohop smoke tests\n=====================\n\n'
+printf '\nkeepsake smoke tests\n=====================\n\n'
 
 # ---------------------------------------------------------------------------
 it "help and version"
 # ---------------------------------------------------------------------------
 H=$(new_home h0)
-run "$H" help    >/dev/null 2>&1 && pass "distrohop help"    || fail "help exited non-zero"
-run "$H" --version >/dev/null 2>&1 && pass "distrohop --version" || fail "--version exited non-zero"
+run "$H" help    >/dev/null 2>&1 && pass "keepsake help"    || fail "help exited non-zero"
+run "$H" --version >/dev/null 2>&1 && pass "keepsake --version" || fail "--version exited non-zero"
 run "$H" bogus-command >/dev/null 2>&1 && fail "unknown command should exit non-zero" || pass "unknown command rejected"
+
+# ---------------------------------------------------------------------------
+it "DISTROHOP_DIR still selects the snapshot dir"
+# ---------------------------------------------------------------------------
+LEGACY_DIR="$SANDBOX/legacy-snapshots"
+mkdir -p "$LEGACY_DIR"
+HOME="$H" XDG_CONFIG_HOME="$H/.config" DISTROHOP_DIR="$LEGACY_DIR" \
+  "$KEEPSAKE" backup --name legacy --groups core >/dev/null 2>&1
+assert_file "$LEGACY_DIR/legacy/files/.zshrc"
+
+# ---------------------------------------------------------------------------
+it "still reads ~/.config/distrohop when ~/.config/keepsake is absent"
+# ---------------------------------------------------------------------------
+HLEG=$(new_home hlegacy)
+mkdir -p "$HLEG/.config/distrohop"
+printf 'dev_root=/tmp/from-legacy-config\n' > "$HLEG/.config/distrohop/settings.conf"
+GOT=$(HOME="$HLEG" XDG_CONFIG_HOME="$HLEG/.config" KEEPSAKE_DIR="$SANDBOX/snapshots" \
+        "$KEEPSAKE" config get dev_root)
+assert "[[ \$GOT == /tmp/from-legacy-config ]]" "config get reads the old distrohop settings.conf"
+assert_no "$HLEG/.config/keepsake"
+
+# ---------------------------------------------------------------------------
+it "install links keepsake and a distrohop alias"
+# ---------------------------------------------------------------------------
+run "$H" install >/dev/null 2>&1
+assert "[[ -L $H/.local/bin/keepsake ]]" "install created ~/.local/bin/keepsake"
+assert "[[ -L $H/.local/bin/distrohop ]]" "install left distrohop as an alias"
+
+# ---------------------------------------------------------------------------
+it "edit opens the manifest in micro even when EDITOR is set"
+# ---------------------------------------------------------------------------
+EDITBIN="$SANDBOX/editbin"
+mkdir -p "$EDITBIN"
+cat > "$EDITBIN/micro" <<EOF
+#!/bin/sh
+printf '%s\n' "\$1" > "$SANDBOX/opened-by-micro"
+EOF
+cat > "$EDITBIN/nano" <<EOF
+#!/bin/sh
+printf '%s\n' "\$1" > "$SANDBOX/opened-by-nano"
+EOF
+chmod +x "$EDITBIN/micro" "$EDITBIN/nano"
+HED=$(new_home hedit)
+HOME="$HED" XDG_CONFIG_HOME="$HED/.config" KEEPSAKE_DIR="$SANDBOX/snapshots" \
+  PATH="$EDITBIN:$PATH" EDITOR=nano \
+  "$KEEPSAKE" edit >/dev/null
+assert_file "$SANDBOX/opened-by-micro"
+assert_no "$SANDBOX/opened-by-nano"
+assert "grep -q manifest.conf '$SANDBOX/opened-by-micro'" "micro was given the manifest path"
 
 # ---------------------------------------------------------------------------
 it "the read-only commands survive a bare environment (set -u)"
 # ---------------------------------------------------------------------------
 # Containers, cron and `su` do not export USER/SHELL/LOGNAME. Under set -u a
 # bare $USER anywhere in a code path is an "unbound variable" exit, which is
-# how `distrohop help` came to fail on every distro container but not on a
+# how `keepsake help` came to fail on every distro container but not on a
 # developer's terminal.
 for cmd in help --version "status --groups core" list; do
   # shellcheck disable=SC2086
   if env -u USER -u SHELL -u LOGNAME \
-       HOME="$H" XDG_CONFIG_HOME="$H/.config" DISTROHOP_DIR="$SANDBOX/snapshots" \
-       "$DISTROHOP" $cmd >/dev/null 2>&1
-  then pass "distrohop $cmd with USER/SHELL/LOGNAME unset"
-  else fail "distrohop $cmd failed with USER/SHELL/LOGNAME unset"
+       HOME="$H" XDG_CONFIG_HOME="$H/.config" KEEPSAKE_DIR="$SANDBOX/snapshots" \
+       "$KEEPSAKE" $cmd >/dev/null 2>&1
+  then pass "keepsake $cmd with USER/SHELL/LOGNAME unset"
+  else fail "keepsake $cmd failed with USER/SHELL/LOGNAME unset"
   fi
 done
 
@@ -174,14 +223,14 @@ mk_snap() { mkdir -p "$P/$1/files" "$P/$1/meta"; printf '%s\n' "$2" > "$P/$1/met
 mk_snap workstation           2026-01-01T00:00:00+00:00
 mk_snap 2026-08-19_100000_box 2026-08-19T10:00:00+00:00
 mk_snap 2026-08-20_100000_box 2026-08-20T10:00:00+00:00
-PRUNED=$(HOME="$H" XDG_CONFIG_HOME="$H/.config" DISTROHOP_DIR="$P" \
-           "$DISTROHOP" prune --keep 2 --dry-run 2>/dev/null)
+PRUNED=$(HOME="$H" XDG_CONFIG_HOME="$H/.config" KEEPSAKE_DIR="$P" \
+           "$KEEPSAKE" prune --keep 2 --dry-run 2>/dev/null)
 assert "grep -q 'would delete workstation' <<< \"\$PRUNED\"" "prune targets the oldest by date"
 assert "! grep -q 'would delete 2026-08-20' <<< \"\$PRUNED\"" "prune spares the newest"
 
 it "list shows newest first"
-LISTED=$(HOME="$H" XDG_CONFIG_HOME="$H/.config" DISTROHOP_DIR="$P" \
-           "$DISTROHOP" list 2>/dev/null | sed -n '2p')
+LISTED=$(HOME="$H" XDG_CONFIG_HOME="$H/.config" KEEPSAKE_DIR="$P" \
+           "$KEEPSAKE" list 2>/dev/null | sed -n '2p')
 assert "grep -q 2026-08-20 <<< \"\$LISTED\"" "newest snapshot is the first row"
 
 # ---------------------------------------------------------------------------
@@ -211,8 +260,8 @@ for missing in python3 hostname awk column; do
 done
 
 H4=$(new_home h4)
-mini() { HOME="$H4" XDG_CONFIG_HOME="$H4/.config" DISTROHOP_DIR="$SANDBOX/snapshots" \
-         PATH="$MINI" "$DISTROHOP" "$@"; }
+mini() { HOME="$H4" XDG_CONFIG_HOME="$H4/.config" KEEPSAKE_DIR="$SANDBOX/snapshots" \
+         PATH="$MINI" "$KEEPSAKE" "$@"; }
 
 OUT=$(mini backup --name mini --groups core 2>&1)
 RC=$?

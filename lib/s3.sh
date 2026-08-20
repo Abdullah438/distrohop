@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# sourced by distrohop — S3 / Cloudflare R2 push and pull of full snapshots
+# sourced by keepsake — S3 / Cloudflare R2 push and pull of full snapshots
 
 S3_CONF="${S3_CONF:-$CONFIG_DIR/s3.conf}"
 
@@ -14,7 +14,7 @@ s3_encrypted() { [[ -n ${password:-} ]]; }
 
 s3_import_env() {
   local envfile=$1
-  [[ -n $envfile ]] || die "usage: distrohop s3 configure ENVFILE"
+  [[ -n $envfile ]] || die "usage: keepsake s3 configure ENVFILE"
   [[ -f $envfile ]] || die "no env file at $envfile"
   python3 - "$envfile" "$S3_CONF" <<'PY'
 import secrets, sys
@@ -32,13 +32,19 @@ missing = [k for k in need if not vals.get(k)]
 if missing:
     sys.exit("missing in %s: %s" % (src, ", ".join(missing)))
 account = vals["R2_ACCOUNT_ID"]
-# Reuse an existing password if this config is being regenerated — rotating it
-# would strand every snapshot already in the bucket.
+# Reuse password and bucket if this config is being regenerated — rotating
+# the password strands every snapshot already uploaded, and a new default
+# bucket name would miss an existing distrohop-era remote.
 password = ""
+bucket = "keepsake"
 if dest.exists():
     for line in dest.read_text().splitlines():
         if line.startswith("password="):
             password = line.split("=", 1)[1].strip().strip("\"'")
+        elif line.startswith("bucket="):
+            existing = line.split("=", 1)[1].strip().strip("\"'")
+            if existing:
+                bucket = existing
 fresh = not password
 if fresh:
     password = secrets.token_urlsafe(32)
@@ -46,7 +52,7 @@ dest.parent.mkdir(parents=True, exist_ok=True)
 dest.write_text(
     "# generated from %s — do not commit\n"
     "endpoint=https://%s.r2.cloudflarestorage.com\n"
-    "bucket=distrohop\n"
+    "bucket=%s\n"
     "prefix=\n"
     "access_key=%s\n"
     "secret_key=%s\n"
@@ -54,7 +60,7 @@ dest.write_text(
     "# Snapshot contents are encrypted with this before upload. Empty = no\n"
     "# encryption. Lose it and every snapshot in the bucket is unreadable.\n"
     "password=%s\n"
-    % (src, account, vals["R2_ACCESS_KEY_ID"], vals["R2_SECRET_ACCESS_KEY"], password)
+    % (src, account, bucket, vals["R2_ACCESS_KEY_ID"], vals["R2_SECRET_ACCESS_KEY"], password)
 )
 dest.chmod(0o600)
 print("fresh-password" if fresh else "kept-password")
@@ -63,13 +69,13 @@ PY
 
 s3_ensure() {
   s3_load_conf && return 0
-  die "no S3 config. Copy s3.conf.example to $S3_CONF, or run: distrohop s3 configure ENVFILE"
+  die "no S3 config. Copy s3.conf.example to $S3_CONF, or run: keepsake s3 configure ENVFILE"
 }
 
 # rclone S3 remote path is remote:BUCKET/key
 s3_remote_path() {
   local name=$1
-  # Empty prefix is intentional: objects live at bucket/<snapshot>, not bucket/distrohop/<snapshot>.
+  # Empty prefix is intentional: objects live at bucket/<snapshot>, not bucket/keepsake/<snapshot>.
   local pfx=${prefix-}
   pfx=${pfx#/}; pfx=${pfx%/}
   local b=${bucket:?s3 bucket not set}
@@ -209,10 +215,10 @@ s3_push_dir() {
   rclone copy "$snap" "$dest" -P --s3-no-check-bucket
   if (( ! WANT_NO_VERIFY )); then
     info "verifying upload"
-    s3_verify "$snap" "$name" --one-way || die "verification FAILED for $name — re-run: distrohop s3 push $name"
+    s3_verify "$snap" "$name" --one-way || die "verification FAILED for $name — re-run: keepsake s3 push $name"
   fi
   ok "uploaded $name  ($(du -sh "$snap" | cut -f1))"
-  info "pull later with:  distrohop s3 pull $name"
+  info "pull later with:  keepsake s3 pull $name"
 }
 
 cmd_s3_push() {
@@ -237,7 +243,7 @@ cmd_s3_push() {
       s3_pack_secrets "$snap"
     fi
   elif [[ ! -d $snap/secrets ]]; then
-    warn "no secrets in this snapshot — include them with: distrohop s3 push $(basename "$snap") --secrets"
+    warn "no secrets in this snapshot — include them with: keepsake s3 push $(basename "$snap") --secrets"
   fi
 
   s3_push_dir "$snap"
@@ -245,7 +251,7 @@ cmd_s3_push() {
 
 cmd_s3_pull() {
   local name=${1:-}
-  [[ -n $name ]] || die "usage: distrohop s3 pull NAME"
+  [[ -n $name ]] || die "usage: keepsake s3 pull NAME"
   s3_rclone_env
   local dest="${DEST_OVERRIDE:-$DATA_DIR}/$name"
   mkdir -p "$(dirname "$dest")"
@@ -253,6 +259,7 @@ cmd_s3_pull() {
   src=$(s3_remote_path "$name")
   if [[ -z ${prefix-} ]]; then
     if ! rclone lsf "r2:${src}" --max-depth 1 2>/dev/null | grep -q .; then
+      # distrohop-era pushes nested the old product name as a prefix.
       local old="${bucket}/distrohop/${name}"
       if rclone lsf "r2:${old}" --max-depth 1 2>/dev/null | grep -q .; then
         warn "using legacy key ${old} (older pushes nested a distrohop/ prefix)"
@@ -283,9 +290,9 @@ cmd_s3_pull() {
   if (( ! WANT_NO_VERIFY )); then
     info "verifying download"
     if (( legacy )) || ! s3_encrypted; then
-      rclone check "r2:${src}" "$dest" --one-way || die "verification FAILED for $dest — re-run: distrohop s3 pull $name"
+      rclone check "r2:${src}" "$dest" --one-way || die "verification FAILED for $dest — re-run: keepsake s3 pull $name"
     else
-      s3_verify "$dest" "$name" || die "verification FAILED for $dest — re-run: distrohop s3 pull $name"
+      s3_verify "$dest" "$name" || die "verification FAILED for $dest — re-run: keepsake s3 pull $name"
     fi
   fi
   # Wrong password decrypts to noise rather than failing outright — say so
@@ -367,6 +374,6 @@ cmd_s3() {
     pull)      cmd_s3_pull "${1:-}" ;;
     ls|list)   cmd_s3_ls ;;
     prune)     cmd_s3_prune ;;
-    *) die "usage: distrohop s3 configure|push|pull|ls|prune  [NAME]  [--secrets]" ;;
+    *) die "usage: keepsake s3 configure|push|pull|ls|prune  [NAME]  [--secrets]" ;;
   esac
 }

@@ -1,6 +1,6 @@
 # shellcheck shell=bash
 # shellcheck disable=SC2034  # UI_* globals are consumed by the main script
-# sourced by distrohop — interactive checklist (restore picker)
+# sourced by keepsake — interactive checklist (restore picker)
 
 # UI_IDS[], UI_LABELS[], UI_ON[] (0|1)
 # On success: UI_PICKED is a space-separated list of ids. Return 1 if cancelled.
@@ -38,7 +38,7 @@ ui_checklist_tty() {
   local drawn=0
   _ui_draw() {
     local i mark ptr buf=""
-    buf+="${C_BOLD}What should distrohop restore?${rs}"$'\n'
+    buf+="${C_BOLD}What should keepsake restore?${rs}"$'\n'
     buf+="${dim}space toggle  enter confirm  a all  n none  q abort${rs}"$'\n'$'\n'
     for (( i=0; i<n; i++ )); do
       if (( UI_ON[i] )); then
@@ -113,7 +113,7 @@ ui_checklist_whiptail() {
   local height=$((n + 8))
   (( height > 22 )) && height=22
   local result
-  result=$(whiptail --title "distrohop restore" --checklist \
+  result=$(whiptail --title "keepsake restore" --checklist \
     "Space toggles an item. Tab to OK." "$height" 78 "$n" \
     "${args[@]}" 3>&1 1>&2 2>&3) || return 1
   UI_PICKED=${result//\"/}
@@ -122,7 +122,7 @@ ui_checklist_whiptail() {
 
 ui_checklist_numbered() {
   local n=${#UI_IDS[@]} i mark
-  printf '\n%sWhat should distrohop restore?%s\n' "$C_BOLD" "$C_RESET" > /dev/tty
+  printf '\n%sWhat should keepsake restore?%s\n' "$C_BOLD" "$C_RESET" > /dev/tty
   printf '%sEnter numbers (e.g. 1 2 5), all, or none. Empty keeps the [x] defaults.%s\n\n' "$C_DIM" "$C_RESET" > /dev/tty
   for (( i=0; i<n; i++ )); do
     if (( UI_ON[i] )); then mark="[x]"; else mark="[ ]"; fi

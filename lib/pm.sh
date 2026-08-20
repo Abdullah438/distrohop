@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# sourced by distrohop — package-manager abstraction (pacman/dnf/apt/zypper)
+# sourced by keepsake — package-manager abstraction (pacman/dnf/apt/zypper)
 # shellcheck disable=SC2034
 
 pm_detect() {

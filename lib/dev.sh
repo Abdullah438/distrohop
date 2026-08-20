@@ -1,16 +1,16 @@
 # shellcheck shell=bash
-# sourced by distrohop — ~/Dev inventory, clone map, envs, compose volumes
+# sourced by keepsake — ~/Dev inventory, clone map, envs, compose volumes
 # shellcheck disable=SC2034
 
-DEV_ROOT="${DISTROHOP_DEV:-${dev_root:-$HOME/Dev}}"
+DEV_ROOT="${KEEPSAKE_DEV:-${DISTROHOP_DEV:-${dev_root:-$HOME/Dev}}}"
 
-# Best-effort desktop notification for the cases where distrohop hits a wall
+# Best-effort desktop notification for the cases where keepsake hits a wall
 # it can't work around unattended (e.g. no docker, no terminal to ask
 # for sudo) — mainly for the systemd timer, where nothing else would ever
 # tell you a backup/restore came back incomplete.
 dev_notify() {
   command -v notify-send >/dev/null 2>&1 || return 0
-  notify-send -a distrohop "distrohop" "$1" 2>/dev/null || true
+  notify-send -a keepsake "keepsake" "$1" 2>/dev/null || true
 }
 
 dev_have_tty() { [[ -t 0 && -c /dev/tty ]]; }
@@ -48,7 +48,7 @@ dev_env_files() {
 
 dev_bind_paths() {
   # extra bind-mount / data dirs from the [dev] manifest section — add yours
-  # with `distrohop edit`.
+  # with `keepsake edit`.
   local rel
   if [[ -f $MANIFEST ]]; then
     while IFS= read -r rel; do
@@ -85,7 +85,7 @@ write_clone_script() {
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-DEV_ROOT="${DISTROHOP_DEV:-$HOME/Dev}"
+DEV_ROOT="${KEEPSAKE_DEV:-${DISTROHOP_DEV:-$HOME/Dev}}"
 LIST="$HERE/repos.tsv"
 DRY=0
 USE_GH=0
@@ -245,7 +245,7 @@ dev_backup_bind() {
       warn "bind $rel: sudo archive failed too"
       rm -f "$dest.tar.gz"
     else
-      dev_notify "backup: '$rel' has files distrohop can't read (permission denied) — install docker, or run 'distrohop backup' in a terminal to unlock it with sudo"
+      dev_notify "backup: '$rel' has files keepsake can't read (permission denied) — install docker, or run 'keepsake backup' in a terminal to unlock it with sudo"
     fi
 
     warn "bind $rel: permission denied on some files — see $(basename "$errlog"); backup is incomplete for this path"
@@ -525,7 +525,7 @@ dev_restore_bind() {
         sudo tar -C "$dest" -xzf "$tarfile" && continue
         warn "bind $rel: sudo restore failed too"
       else
-        dev_notify "restore: '$rel' needs root to restore with its original ownership — install docker, or run 'distrohop restore' in a terminal to unlock it with sudo"
+        dev_notify "restore: '$rel' needs root to restore with its original ownership — install docker, or run 'keepsake restore' in a terminal to unlock it with sudo"
       fi
       warn "bind $rel: not restored — run by hand: sudo tar -C '$dest' -xzf '$tarfile'"
     else
