@@ -225,7 +225,9 @@ assert_no "$SANDBOX/snapshots/mini/packages/dev-apps.json"
 mini status --groups core >/dev/null 2>&1 && pass "status exits 0" || fail "status failed"
 mini list >/dev/null 2>&1                 && pass "list exits 0"   || fail "list failed"
 mini show mini >/dev/null 2>&1            && pass "show exits 0"   || fail "show failed"
-assert "[[ \$(mini list 2>/dev/null | sed -n '2p') == *mini* ]]" "list still renders a row"
+MINI_LIST=$(mini list 2>/dev/null)
+assert "[[ -n \$(sed -n '2p' <<< \"\$MINI_LIST\") ]]" "list renders rows, not just a header"
+assert "grep -q mini <<< \"\$MINI_LIST\"" "list includes the snapshot just taken"
 
 # ---------------------------------------------------------------------------
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"

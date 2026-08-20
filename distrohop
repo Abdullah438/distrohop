@@ -936,7 +936,7 @@ list_snapshot_dirs() {
       [[ -n $when ]] || when=$(date -Iseconds -d "@$epoch" 2>/dev/null || echo unknown)
     fi
     printf '%s\t%s\t%s\n' "$epoch" "$when" "$d"
-  done | sort -n -k1,1
+  done | sort -t $'\t' -k1,1n -k3,3
   shopt -u nullglob
 }
 
