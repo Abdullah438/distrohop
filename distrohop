@@ -18,6 +18,9 @@ DATA_DIR="${DISTROHOP_DIR:-$HOME/Backups/distrohop}"
 MANIFEST="$CONFIG_DIR/manifest.conf"
 SETTINGS_CONF="${SETTINGS_CONF:-$CONFIG_DIR/settings.conf}"
 
+# Only ever used as display text in usage(); $USER is not set everywhere.
+USER_DISPLAY=${USER:-$(id -un 2>/dev/null || echo user)}
+
 DEFAULT_GROUPS=(core apps gtk editor packages dev)
 ALL_FILE_GROUPS=(core apps gtk editor secrets extra)
 PRUNE_DEFAULT_KEEP=10
@@ -100,7 +103,7 @@ ${C_BOLD}EXAMPLES${C_RESET}
   distrohop backup --name workstation
   distrohop backup --secrets
   distrohop backup --secrets --push             # backup, then upload to S3/R2
-  distrohop backup --dest /run/media/$USER/USB --archive --secrets
+  distrohop backup --dest /run/media/$USER_DISPLAY/USB --archive --secrets
   distrohop restore workstation                 # checkbox picker
   distrohop restore workstation --yes           # defaults, no prompt
   distrohop restore workstation --pull          # download from S3/R2 first
@@ -1424,7 +1427,7 @@ cmd_bootstrap() {
     fi
   fi
 
-  if [[ $SHELL != *zsh ]]; then
+  if [[ ${SHELL:-} != *zsh ]]; then
     info "switching login shell to zsh"
     local zsh_bin; zsh_bin=$(command -v zsh || true)
     if [[ -n $zsh_bin ]]; then

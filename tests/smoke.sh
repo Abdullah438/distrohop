@@ -68,6 +68,23 @@ run "$H" --version >/dev/null 2>&1 && pass "distrohop --version" || fail "--vers
 run "$H" bogus-command >/dev/null 2>&1 && fail "unknown command should exit non-zero" || pass "unknown command rejected"
 
 # ---------------------------------------------------------------------------
+it "the read-only commands survive a bare environment (set -u)"
+# ---------------------------------------------------------------------------
+# Containers, cron and `su` do not export USER/SHELL/LOGNAME. Under set -u a
+# bare $USER anywhere in a code path is an "unbound variable" exit, which is
+# how `distrohop help` came to fail on every distro container but not on a
+# developer's terminal.
+for cmd in help --version "status --groups core" list; do
+  # shellcheck disable=SC2086
+  if env -u USER -u SHELL -u LOGNAME \
+       HOME="$H" XDG_CONFIG_HOME="$H/.config" DISTROHOP_DIR="$SANDBOX/snapshots" \
+       "$DISTROHOP" $cmd >/dev/null 2>&1
+  then pass "distrohop $cmd with USER/SHELL/LOGNAME unset"
+  else fail "distrohop $cmd failed with USER/SHELL/LOGNAME unset"
+  fi
+done
+
+# ---------------------------------------------------------------------------
 it "status runs against a fresh home"
 # ---------------------------------------------------------------------------
 run "$H" status --groups core >/dev/null 2>&1 && pass "status --groups core" || fail "status exited non-zero"
