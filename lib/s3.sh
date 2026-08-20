@@ -211,7 +211,7 @@ s3_push_dir() {
     info "verifying upload"
     s3_verify "$snap" "$name" --one-way || die "verification FAILED for $name — re-run: distrohop s3 push $name"
   fi
-  ok "uploaded $name  ($(du -sh "$snap" | awk '{print $1}'))"
+  ok "uploaded $name  ($(du -sh "$snap" | cut -f1))"
   info "pull later with:  distrohop s3 pull $name"
 }
 

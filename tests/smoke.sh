@@ -177,27 +177,39 @@ run "$H" s3 push plain >/dev/null 2>&1
 assert_no "$SNAP/secrets"
 
 # ---------------------------------------------------------------------------
-it "backup survives a host with no python3 and no hostname"
+it "works on a host with only bash, rsync and coreutils"
 # ---------------------------------------------------------------------------
-# Build a PATH that deliberately excludes python3 and hostname; the dev-apps
-# inventory should be skipped with a warning while the snapshot still lands.
+# Build a PATH holding only what the README claims to require. Everything
+# else — python3, hostname, awk, column — is optional and must degrade rather
+# than fail: openSUSE Tumbleweed ships no awk, and `du | awk` in a command
+# substitution turned that into a hard exit under set -e.
 MINI="$SANDBOX/minibin"
 mkdir -p "$MINI"
-for c in bash sh rsync find sort date mkdir cp mv rm chmod chown du awk grep sed \
+for c in bash sh rsync find sort date mkdir cp mv rm chmod chown du grep sed \
          cat wc stat xargs sha256sum tar basename dirname head tail cut tr paste \
-         ls uname comm column touch env id readlink; do
+         tac ls uname comm touch env id readlink; do
   p=$(command -v "$c" 2>/dev/null) && ln -sf "$p" "$MINI/$c"
 done
-assert "! PATH='$MINI' command -v python3 >/dev/null" "test PATH really has no python3"
-assert "! PATH='$MINI' command -v hostname >/dev/null" "test PATH really has no hostname"
+for missing in python3 hostname awk column; do
+  assert "! PATH='$MINI' command -v $missing >/dev/null" "test PATH really has no $missing"
+done
+
 H4=$(new_home h4)
-OUT=$(HOME="$H4" XDG_CONFIG_HOME="$H4/.config" DISTROHOP_DIR="$SANDBOX/snapshots" \
-      PATH="$MINI" "$DISTROHOP" backup --name mini --groups core 2>&1)
+mini() { HOME="$H4" XDG_CONFIG_HOME="$H4/.config" DISTROHOP_DIR="$SANDBOX/snapshots" \
+         PATH="$MINI" "$DISTROHOP" "$@"; }
+
+OUT=$(mini backup --name mini --groups core 2>&1)
 RC=$?
-assert "(( $RC == 0 ))" "backup exits 0 without python3/hostname"
+assert "(( $RC == 0 ))" "backup exits 0"
 assert_file "$SANDBOX/snapshots/mini/files/.zshrc"
 assert "grep -qi 'python3 not found' <<< \"\$OUT\"" "warned about the skipped dev-apps inventory"
 assert_no "$SANDBOX/snapshots/mini/packages/dev-apps.json"
+
+# These are the ones awk actually broke: both print a du size per row.
+mini status --groups core >/dev/null 2>&1 && pass "status exits 0" || fail "status failed"
+mini list >/dev/null 2>&1                 && pass "list exits 0"   || fail "list failed"
+mini show mini >/dev/null 2>&1            && pass "show exits 0"   || fail "show failed"
+assert "[[ \$(mini list 2>/dev/null | sed -n '2p') == *mini* ]]" "list still renders a row"
 
 # ---------------------------------------------------------------------------
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"

@@ -92,7 +92,9 @@ devapps_pyenv_info() {
     versions+=("$(basename "$d")")
   done
   local ver=""
-  command -v pyenv >/dev/null 2>&1 && ver=$(pyenv --version 2>/dev/null | awk '{print $2}')
+  if command -v pyenv >/dev/null 2>&1; then
+    read -r _ ver _ < <(pyenv --version 2>/dev/null) || true
+  fi
   python3 - "$ver" "${versions[*]}" <<'PY'
 import json, sys
 ver, vers = sys.argv[1], sys.argv[2].split()

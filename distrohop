@@ -669,15 +669,15 @@ cmd_clean() {
   if [[ -z $OLDER_THAN ]]; then
     printf '%s%d *.pre-hop.* leftover(s)%s\n' "$C_BOLD" "${#uniq[@]}" "$C_RESET"
     for f in "${uniq[@]}"; do
-      printf '  %-60s %s\n' "$f" "$(du -sh "$f" 2>/dev/null | awk '{print $1}')"
+      printf '  %-60s %s\n' "$f" "$(du -sh "$f" 2>/dev/null | cut -f1)"
     done
-    printf '  %stotal: %s%s\n' "$C_DIM" "$(du -shc "${uniq[@]}" 2>/dev/null | tail -1 | awk '{print $1}')" "$C_RESET"
+    printf '  %stotal: %s%s\n' "$C_DIM" "$(du -shc "${uniq[@]}" 2>/dev/null | tail -1 | cut -f1)" "$C_RESET"
     info "nothing deleted — re-run with --older-than N (or --older-than 0 to remove all of the above)"
     return 0
   fi
 
   local reclaimed
-  reclaimed=$(du -shc "${uniq[@]}" 2>/dev/null | tail -1 | awk '{print $1}')
+  reclaimed=$(du -shc "${uniq[@]}" 2>/dev/null | tail -1 | cut -f1)
   for f in "${uniq[@]}"; do
     if (( DRY_RUN )); then
       printf '  would delete %s\n' "$f"
@@ -780,7 +780,7 @@ cmd_status() {
       if item_exists "$src"; then
         ((shown)) || { printf '%s[%s]%s\n' "$C_BOLD" "$g" "$C_RESET"; shown=1; }
         local sz
-        sz=$(du -sh "$src" 2>/dev/null | awk '{print $1}')
+        sz=$(du -sh "$src" 2>/dev/null | cut -f1)
         printf '  %-42s %s\n' "~/$rel" "$sz"
         count=$((count + 1))
       else
@@ -893,10 +893,10 @@ cmd_backup() {
     if [[ -d $dest/secrets ]]; then
       chmod 600 "$archive" 2>/dev/null || true
     fi
-    ok "archive $(du -sh "$archive" | awk '{print $1}')  $archive"
+    ok "archive $(du -sh "$archive" | cut -f1)  $archive"
   fi
 
-  ok "copied $copied items  $(du -sh "$dest" | awk '{print $1}')"
+  ok "copied $copied items  $(du -sh "$dest" | cut -f1)"
 
   if (( WANT_PUSH )); then
     declare -F s3_push_dir >/dev/null || die "s3 push unavailable (lib/s3.sh missing)"
@@ -988,7 +988,7 @@ cmd_list() {
   local line name size mark n found
   while IFS=$'\t' read -r when d; do
     name=$(basename "$d")
-    size=$(du -sh "$d" | awk '{print $1}')
+    size=$(du -sh "$d" | cut -f1)
     if (( check_remote )); then
       found=0
       for n in "${remote_names[@]}"; do
@@ -1114,7 +1114,11 @@ cmd_show() {
   fi
   if [[ -f $snap/MANIFEST.txt ]]; then
     printf '%sContents%s\n' "$C_BOLD" "$C_RESET"
-    column -t -s $'\t' "$snap/MANIFEST.txt"
+    if command -v column >/dev/null 2>&1; then
+      column -t -s $'\t' "$snap/MANIFEST.txt"
+    else
+      cat "$snap/MANIFEST.txt"
+    fi
   fi
 }
 
