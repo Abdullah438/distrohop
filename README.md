@@ -16,6 +16,40 @@ It isn't a dotfiles manager and it doesn't symlink anything into place — it co
 - `rclone` — optional, only needed for `distrohop s3` (R2/S3 push/pull). Also provides the client-side encryption for uploads.
 - `gh`, `paru`, `flatpak`, `pm2`, `supabase`, `dconf` — optional, each used only if the corresponding feature applies to your setup.
 
+## Supported systems
+
+Linux only — distrohop leans on `rsync`, `/etc/os-release`, XDG paths and (optionally) systemd user units. It does not run on macOS or the BSDs.
+
+| Distribution | Package manager | Snapshot + restore | Package list | `packages apply` | `bootstrap` |
+| --- | --- | :-: | :-: | --- | --- |
+| Arch · CachyOS · EndeavourOS · Manjaro | `pacman` (+ AUR via `paru`) | ✅ | ✅ | ◐ repo **and** AUR | ◐ everything as system packages |
+| Fedora · RHEL · Rocky · AlmaLinux | `dnf` / `dnf5` | ✅ | ✅ | ◐ names remapped | ◐ packaged tools, plugins git-cloned |
+| Debian · Ubuntu · Mint · Pop!\_OS | `apt` | ✅ | ✅ | ◐ names remapped | ◐ packaged tools, plugins git-cloned |
+| openSUSE Tumbleweed · Leap | `zypper` | ✅ | ✅ [^1] | ◐ names remapped | ◐ packaged tools, plugins git-cloned |
+| Any other Linux | none detected | ✅ | — [^2] | — | — |
+
+✅ — exercised by the smoke suite on every push. Ubuntu runs natively on the runner; Arch, Fedora, Debian and openSUSE run the identical suite in containers, which is what keeps the non-Arch paths honest.
+◐ — implemented and in use, but not covered by CI: installing packages and switching your login shell need root and a real machine, so these are verified by hand rather than on every push.
+
+Snapshots are portable across every row. Taking one on Arch and restoring it on Debian is the whole point — config files copy verbatim, and package names are remapped on the way in (`github-cli` → `gh`, `docker` → `docker.io`, `jdk-openjdk` → `default-jdk`, …). Anything with no equivalent lands in `packages/unresolved.txt` instead of failing the restore.
+
+[^1]: Needs `/var/lib/zypp/AutoInstalled` to tell explicit installs from dependencies. Without it distrohop warns and falls back to the full installed list, which is noisier but not wrong.
+[^2]: Config files, `~/Dev`, secrets and docker volumes all still work — you just get no package list, and `packages/explicit.txt` is left empty with a warning.
+
+### Desktops
+
+Only two things are desktop-specific; everything else in a snapshot is DE-agnostic.
+
+| Desktop | GTK config | `dconf` export | Desktop-session package split |
+| --- | :-: | :-: | --- |
+| KDE Plasma | ✅ | ✅ | built-in classifier (on `pacman`) |
+| GNOME · Xfce · Cinnamon · others | ✅ | ✅ | `[packages_exclude]` globs |
+| Headless · WSL · server | n/a | — | not needed |
+
+The built-in split only engages when the live session is actually KDE *and* the package manager is `pacman`; everywhere else the same job is done by glob patterns you put under `[packages_exclude]` in the manifest (`distrohop edit`). `dconf` export/import is opt-in on any desktop that has `dconf` installed.
+
+Worth being clear about what the `gtk` group is: `gtk-3.0`, `gtk-4.0` and `.gtkrc-2.0`, nothing more. Your desktop's own session settings — Plasma's `kdeglobals`, GNOME's extension list, panel layouts, keybindings — are **not** in the default manifest, because they are the part most likely to fight you across a version change. Add the paths you actually want under `[extra]`, or lean on `dconf export` where the desktop stores its settings there.
+
 ## Install
 
 ```bash
