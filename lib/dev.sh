@@ -3,6 +3,17 @@
 
 DEV_ROOT="${DISTROHOP_DEV:-${dev_root:-$HOME/Dev}}"
 
+# Best-effort desktop notification for the cases where distrohop hits a wall
+# it can't work around unattended (e.g. no docker, no terminal to ask
+# for sudo) — mainly for the systemd timer, where nothing else would ever
+# tell you a backup/restore came back incomplete.
+dev_notify() {
+  command -v notify-send >/dev/null 2>&1 || return 0
+  notify-send -a distrohop "distrohop" "$1" 2>/dev/null || true
+}
+
+dev_have_tty() { [[ -t 0 && -c /dev/tty ]]; }
+
 dev_repos() {
   # prints: relpath<TAB>branch<TAB>origin
   [[ -d $DEV_ROOT ]] || return 0
@@ -197,19 +208,65 @@ dev_backup_bind() {
   local out=$1
   mkdir -p "$out/bind"
   : > "$out/bind/PATHS.txt"
-  local rel src dest
+  local rel src dest errlog img
   while IFS= read -r rel; do
     [[ -z $rel ]] && continue
     src="$HOME/$rel"
     [[ -d $src ]] || continue
     dest="$out/bind/$rel"
+    errlog="$dest.errors.log"
     if (( DRY_RUN )); then
       printf '  bind %s\n' "$rel"
-    else
-      mkdir -p "$dest"
-      rsync -a --exclude='.git/' --exclude='node_modules/' "$src/" "$dest/"
-      printf '%s\n' "$rel" >> "$out/bind/PATHS.txt"
+      continue
     fi
+
+    mkdir -p "$(dirname "$dest")"
+    rm -rf "$dest" "$dest.tar.gz"
+    mkdir -p "$dest"
+    if rsync -a --exclude='.git/' --exclude='node_modules/' "$src/" "$dest/" 2> "$errlog"; then
+      rm -f "$errlog"
+      printf '%s\n' "$rel" >> "$out/bind/PATHS.txt"
+      continue
+    fi
+
+    # Some entries need root to read (a redis/postgres data dir owned by the
+    # container's service uid, often mixed with plain host-owned files
+    # elsewhere under the same configured path). Archive it via root instead
+    # of mirroring loose files: tar preserves the real per-file owner/mode,
+    # and a single root-owned .tar.gz (created world-readable by default)
+    # is still something we can archive/push afterward, unlike a directory
+    # tree of 600-mode files owned by a uid we aren't. Try silently via
+    # docker first (works unattended, e.g. the systemd timer); if that's
+    # not available, ask for sudo when there's a terminal to ask on; if
+    # neither applies, notify (best-effort) and fall back to whatever the
+    # plain rsync above already managed to copy.
+    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+      warn "bind $rel: rsync hit read errors as your user — archiving via docker as root instead"
+      img=$(dev_tar_image)
+      if docker run --rm --user 0 \
+          -v "$src":/from:ro -v "$(dirname "$dest")":/to \
+          "$img" tar -C /from -czf "/to/$(basename "$dest").tar.gz" .; then
+        rm -rf "$dest" "$errlog"
+        printf '%s\ttar\n' "$rel" >> "$out/bind/PATHS.txt"
+        continue
+      fi
+      warn "bind $rel: privileged archive via docker failed"
+      rm -f "$dest.tar.gz"
+    elif dev_have_tty; then
+      warn "bind $rel: rsync hit read errors as your user — enter your password to read it as root (sudo)"
+      if sudo tar -C "$src" -czf "$dest.tar.gz" . && sudo chown "$(id -u):$(id -g)" "$dest.tar.gz"; then
+        rm -rf "$dest" "$errlog"
+        printf '%s\ttar\n' "$rel" >> "$out/bind/PATHS.txt"
+        continue
+      fi
+      warn "bind $rel: sudo archive failed too"
+      rm -f "$dest.tar.gz"
+    else
+      dev_notify "backup: '$rel' has files distrohop can't read (permission denied) — install docker, or run 'distrohop backup' in a terminal to unlock it with sudo"
+    fi
+
+    warn "bind $rel: permission denied on some files — see $(basename "$errlog"); backup is incomplete for this path"
+    printf '%s\n' "$rel" >> "$out/bind/PATHS.txt"
   done < <(dev_bind_paths | sort -u)
 }
 
@@ -316,21 +373,39 @@ dev_backup_volumes() {
     return 0
   fi
 
-  local img name dest n=0
+  local img name dest errlog n=0
   img=$(dev_tar_image)
   : > "$out/volumes/NAMES.txt"
   while IFS= read -r name; do
     [[ -z $name ]] && continue
     dest="$out/volumes/${name}.tar.gz"
+    errlog="$out/volumes/${name}.errors.log"
     info "volume $name"
     if (( DRY_RUN )); then
       printf '  vol  %s\n' "$name"
     else
-      docker run --rm \
+      rm -f "$dest" "$errlog"
+      # --user 0: some images (e.g. redis's data dir is owned by uid 999)
+      # would otherwise archive as a non-root default user and hit denied
+      # reads on every file. Even as root, a handful of entries can still
+      # fail (sockets, files a live process deletes mid-tar) — that's not
+      # worth losing the whole volume over, so keep whatever tar produced
+      # and only treat it as a real failure if the archive came out empty.
+      docker run --rm --user 0 \
         -v "$name":/from:ro \
         -v "$out/volumes":/to \
         "$img" tar -C /from -czf "/to/${name}.tar.gz" . \
-        || { warn "volume tar failed: $name"; continue; }
+        2> "$errlog"
+      if [[ ! -s $dest ]]; then
+        warn "volume tar failed: $name"
+        rm -f "$dest" "$errlog"
+        continue
+      fi
+      if [[ -s $errlog ]]; then
+        warn "volume $name: backed up with some entries skipped (see volumes/$(basename "$errlog"))"
+      else
+        rm -f "$errlog"
+      fi
     fi
     printf '%s\n' "$name" >> "$out/volumes/NAMES.txt"
     n=$((n + 1))
@@ -438,14 +513,39 @@ dev_restore_bind() {
   local snap=$1
   local src="$snap/dev/bind"
   [[ -f $src/PATHS.txt ]] || return 0
-  local rel dest
-  while IFS= read -r rel; do
+  local rel kind dest img tarfile
+  while IFS=$'\t' read -r rel kind; do
     [[ -z $rel ]] && continue
     dest="$HOME/$rel"
     if (( DRY_RUN )); then
       printf '  bind %s\n' "$rel"
+      continue
+    fi
+
+    mkdir -p "$dest"
+    if [[ $kind == tar ]]; then
+      tarfile="$src/$rel.tar.gz"
+      if [[ ! -f $tarfile ]]; then
+        warn "bind $rel: missing $(basename "$tarfile") — skipping"
+        continue
+      fi
+      if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+        img=$(dev_tar_image)
+        if docker run --rm --user 0 \
+            -v "$dest":/to -v "$(dirname "$tarfile")":/from:ro \
+            "$img" tar -C /to -xzf "/from/$(basename "$tarfile")"; then
+          continue
+        fi
+        warn "bind $rel: privileged restore via docker failed"
+      elif dev_have_tty; then
+        warn "bind $rel: enter your password to restore it with its original ownership (sudo)"
+        sudo tar -C "$dest" -xzf "$tarfile" && continue
+        warn "bind $rel: sudo restore failed too"
+      else
+        dev_notify "restore: '$rel' needs root to restore with its original ownership — install docker, or run 'distrohop restore' in a terminal to unlock it with sudo"
+      fi
+      warn "bind $rel: not restored — run by hand: sudo tar -C '$dest' -xzf '$tarfile'"
     else
-      mkdir -p "$dest"
       rsync -a "$src/$rel/" "$dest/"
     fi
   done < "$src/PATHS.txt"
@@ -468,7 +568,7 @@ dev_restore_volumes() {
       continue
     fi
     docker volume create "$name" >/dev/null
-    docker run --rm \
+    docker run --rm --user 0 \
       -v "$name":/to \
       -v "$src":/from:ro \
       "$img" tar -C /to -xzf "/from/${name}.tar.gz" \
