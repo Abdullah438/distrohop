@@ -120,6 +120,22 @@ assert "[[ \$(stat -c %a '$SEC') == 700 ]]" "snapshot root is 0700 when it holds
 assert "[[ \$(stat -c %a '$SEC/secrets') == 700 ]]" "secrets/ is 0700"
 
 # ---------------------------------------------------------------------------
+it "the package list is one name per line"
+# ---------------------------------------------------------------------------
+# dnf's --qf does not append a newline, so `--qf '%{name}'` silently produced
+# every package name concatenated into a single line on Fedora. Assert the
+# shape of the file rather than any particular package manager's output.
+PKGS="$SNAP/packages/explicit.txt"
+assert_file "$PKGS"
+if [[ -s $PKGS ]]; then
+  MAXLEN=$(wc -L < "$PKGS")
+  assert "(( MAXLEN <= 120 ))" "no run-together line in explicit.txt (longest is $MAXLEN chars)"
+  assert "! grep -q ' ' '$PKGS'" "no package name contains a space"
+else
+  pass "explicit.txt is empty on this host (no package manager, or nothing explicit)"
+fi
+
+# ---------------------------------------------------------------------------
 it "SHA256SUMS and verify"
 # ---------------------------------------------------------------------------
 assert_file "$SNAP/SHA256SUMS"

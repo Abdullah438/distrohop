@@ -31,7 +31,8 @@ pm_pkg_available() {
   case $pm in
     pacman) pacman -Si "$p" >/dev/null 2>&1 ;;
     dnf) dnf list --available "$p" >/dev/null 2>&1 ;;
-    # best-effort: unverified against a real zypper install
+    # verified against opensuse/tumbleweed; older Leap zypper prints the same
+    # "Repository :" header, so the grep should hold there too
     zypper) zypper --non-interactive info "$p" 2>/dev/null | grep -qi '^Repository *:' ;;
     apt) apt-cache show "$p" >/dev/null 2>&1 ;;
     *) return 1 ;;
@@ -60,13 +61,16 @@ pm_explicit_packages() {
   local pm=$1
   case $pm in
     pacman) pacman -Qqe 2>/dev/null ;;
-    # dnf5 (Fedora 41+) is usually aliased to the `dnf` binary and accepts
-    # the same repoquery flags; unverified on a real dnf5-only host.
-    dnf) dnf repoquery --userinstalled --qf '%{name}' 2>/dev/null ;;
+    # dnf5 (Fedora 41+) is aliased to the `dnf` binary and accepts the same
+    # repoquery flags. The trailing \n is load-bearing: --qf does not add one,
+    # so without it every package name is concatenated onto a single line and
+    # explicit.txt comes out as one unusable token.
+    dnf) dnf repoquery --userinstalled --qf '%{name}\n' 2>/dev/null ;;
     apt) apt-mark showmanual 2>/dev/null ;;
     zypper)
-      # best-effort: filters against zypper's auto-installed marker file,
-      # unverified across zypper versions — falls back to the full list.
+      # Filters against zypper's auto-installed marker file. Verified on
+      # Tumbleweed (the marker is present in a bare container); falls back to
+      # the full installed list, loudly, wherever it is missing.
       if [[ -r /var/lib/zypp/AutoInstalled ]]; then
         comm -23 <(rpm -qa --qf '%{NAME}\n' 2>/dev/null | sort -u) \
                   <(sort -u /var/lib/zypp/AutoInstalled)
