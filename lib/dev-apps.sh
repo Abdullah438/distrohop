@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # sourced by distrohop — record and reinstall main development apps
 
 # id \t label \t detectors (a|b|c) \t packages \t extra-note
@@ -91,7 +92,9 @@ devapps_pyenv_info() {
     versions+=("$(basename "$d")")
   done
   local ver=""
-  command -v pyenv >/dev/null 2>&1 && ver=$(pyenv --version 2>/dev/null | awk '{print $2}')
+  if command -v pyenv >/dev/null 2>&1; then
+    read -r _ ver _ < <(pyenv --version 2>/dev/null) || true
+  fi
   python3 - "$ver" "${versions[*]}" <<'PY'
 import json, sys
 ver, vers = sys.argv[1], sys.argv[2].split()
@@ -127,7 +130,15 @@ devapps_backup() {
   local out="$snap/packages"
   mkdir -p "$out"
 
-  local apps_json="[]"
+  # dev-apps is the one group that needs python3 (JSON). Everything else in a
+  # snapshot is plain text, so a host without python3 should lose this
+  # inventory and nothing more.
+  if ! command -v python3 >/dev/null 2>&1; then
+    warn "python3 not found — skipping the dev-apps inventory (the rest of the snapshot is unaffected)"
+    return 0
+  fi
+
+  local apps_tsv=""
   local id label detectors packages note
   local det matched via
   while IFS=$'\t' read -r id label detectors packages note || [[ -n ${id:-} ]]; do
@@ -144,19 +155,7 @@ devapps_backup() {
       fi
     done
     (( matched )) || continue
-    apps_json=$(APP_ID="$id" APP_LABEL="$label" APP_VIA="$via" APP_PKGS="$packages" APP_NOTE="${note:-}" APP_JSON="$apps_json" python3 - <<'PY'
-import json, os
-apps = json.loads(os.environ["APP_JSON"])
-apps.append({
-    "id": os.environ["APP_ID"],
-    "label": os.environ["APP_LABEL"],
-    "detected_via": os.environ["APP_VIA"],
-    "packages": os.environ["APP_PKGS"].split(),
-    "note": os.environ.get("APP_NOTE", ""),
-})
-print(json.dumps(apps))
-PY
-)
+    apps_tsv+="$id"$'\t'"$label"$'\t'"$via"$'\t'"$packages"$'\t'"${note:-}"$'\n'
   done < <(devapps_catalog)
 
   local nvm_json="null" pyenv_json="null"
@@ -165,11 +164,23 @@ PY
   local npm_list
   npm_list=$(devapps_npm_globals | paste -sd' ' -)
 
-  python3 - "$out/dev-apps.json" "$apps_json" "$nvm_json" "$pyenv_json" "$npm_list" <<'PY'
-import json, sys
-dest, apps, nvm, pyenv, npm = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+  APPS_TSV="$apps_tsv" python3 - "$out/dev-apps.json" "$nvm_json" "$pyenv_json" "$npm_list" <<'PY'
+import json, os, sys
+dest, nvm, pyenv, npm = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+apps = []
+for line in os.environ.get("APPS_TSV", "").splitlines():
+    if not line.strip():
+        continue
+    f = (line.split("\t") + [""] * 5)[:5]
+    apps.append({
+        "id": f[0],
+        "label": f[1],
+        "detected_via": f[2],
+        "packages": f[3].split(),
+        "note": f[4],
+    })
 doc = {
-    "apps": json.loads(apps),
+    "apps": apps,
     "nvm": None if nvm == "null" else json.loads(nvm),
     "pyenv": None if pyenv == "null" else json.loads(pyenv),
     "npm_globals": [x for x in npm.split() if x],
@@ -209,7 +220,7 @@ open(sys.argv[2], "w").write("\n".join(lines) + "\n")
 PY
 
   local n
-  n=$(python3 -c "import json,sys; print(len(json.load(open(sys.argv[1])).get('apps') or []))" "$out/dev-apps.json")
+  n=$(grep -c . <<< "$apps_tsv" || true)
   ok "dev apps: $n recorded → packages/dev-apps.txt"
 }
 
@@ -407,6 +418,10 @@ devapps_restore() {
   local snap=$1
   local file="$snap/packages/dev-apps.json"
   [[ -f $file ]] || { warn "no packages/dev-apps.json in this snapshot"; return 0; }
+  if ! command -v python3 >/dev/null 2>&1; then
+    warn "python3 not found — skipping dev-apps install; read packages/dev-apps.txt and install by hand"
+    return 0
+  fi
 
   INSTALLED_PKGS=()
   FAILED_PKGS=()

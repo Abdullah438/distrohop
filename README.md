@@ -1,5 +1,7 @@
 # distrohop
 
+[![CI](https://github.com/Abdullah438/distrohop/actions/workflows/ci.yml/badge.svg)](https://github.com/Abdullah438/distrohop/actions/workflows/ci.yml)
+
 *Reinstall the distro. Keep the parts of your life that took years to configure.*
 
 Every distro hop is the same trade: a fresh install in twenty minutes, then three days rebuilding zsh, re-authing `gh`, remembering which `.env` files existed, and guessing at the seventeen packages you forgot you had. distrohop is the part that remembers for you — it snapshots the configs, dev-environment state, and package lists that should survive a reinstall, then puts them back on the new box.
@@ -8,10 +10,45 @@ It isn't a dotfiles manager and it doesn't symlink anything into place — it co
 
 ## Requirements
 
-- `bash`, `rsync`, `python3` — required, used for every backup/restore.
+- `bash`, `rsync`, `coreutils` — required, used for every backup/restore.
+- `python3` — optional, only needed for the development-apps inventory (Cursor, Docker, nvm, pyenv, …). Without it that one section is skipped with a warning and everything else still works.
 - `docker` — optional, only needed to back up/restore named volumes and compose bind-mounts.
-- `rclone` — optional, only needed for `distrohop s3` (R2/S3 push/pull).
+- `rclone` — optional, only needed for `distrohop s3` (R2/S3 push/pull). Also provides the client-side encryption for uploads.
 - `gh`, `paru`, `flatpak`, `pm2`, `supabase`, `dconf` — optional, each used only if the corresponding feature applies to your setup.
+
+## Supported systems
+
+Linux only — distrohop leans on `rsync`, `/etc/os-release`, XDG paths and (optionally) systemd user units. It does not run on macOS or the BSDs.
+
+| Distribution | Package manager | Snapshot + restore | Package list | `packages apply` | `bootstrap` |
+| --- | --- | :-: | :-: | --- | --- |
+| Arch · CachyOS · EndeavourOS · Manjaro | `pacman` (+ AUR via `paru`) | ✅ | ✅ | ◐ repo **and** AUR | ◐ everything as system packages |
+| Fedora · RHEL · Rocky · AlmaLinux | `dnf` / `dnf5` | ✅ | ✅ | ◐ names remapped | ◐ packaged tools, plugins git-cloned |
+| Debian · Ubuntu · Mint · Pop!\_OS | `apt` | ✅ | ✅ | ◐ names remapped | ◐ packaged tools, plugins git-cloned |
+| openSUSE Tumbleweed · Leap | `zypper` | ✅ | ✅ [^1] | ◐ names remapped | ◐ packaged tools, plugins git-cloned |
+| Any other Linux | none detected | ✅ | — [^2] | — | — |
+
+✅ — exercised by the smoke suite on every push. Ubuntu runs natively on the runner; Arch, Fedora, Debian and openSUSE run the identical suite in containers, which is what keeps the non-Arch paths honest.
+◐ — implemented and in use, but not covered by CI: installing packages and switching your login shell need root and a real machine, so these are verified by hand rather than on every push.
+
+Snapshots are portable across every row. Taking one on Arch and restoring it on Debian is the whole point — config files copy verbatim, and package names are remapped on the way in (`github-cli` → `gh`, `docker` → `docker.io`, `jdk-openjdk` → `default-jdk`, …). Anything with no equivalent lands in `packages/unresolved.txt` instead of failing the restore.
+
+[^1]: Needs `/var/lib/zypp/AutoInstalled` to tell explicit installs from dependencies. Without it distrohop warns and falls back to the full installed list, which is noisier but not wrong.
+[^2]: Config files, `~/Dev`, secrets and docker volumes all still work — you just get no package list, and `packages/explicit.txt` is left empty with a warning.
+
+### Desktops
+
+Only two things are desktop-specific; everything else in a snapshot is DE-agnostic.
+
+| Desktop | GTK config | `dconf` export | Desktop-session package split |
+| --- | :-: | :-: | --- |
+| KDE Plasma | ✅ | ✅ | built-in classifier (on `pacman`) |
+| GNOME · Xfce · Cinnamon · others | ✅ | ✅ | `[packages_exclude]` globs |
+| Headless · WSL · server | n/a | — | not needed |
+
+The built-in split only engages when the live session is actually KDE *and* the package manager is `pacman`; everywhere else the same job is done by glob patterns you put under `[packages_exclude]` in the manifest (`distrohop edit`). `dconf` export/import is opt-in on any desktop that has `dconf` installed.
+
+Worth being clear about what the `gtk` group is: `gtk-3.0`, `gtk-4.0` and `.gtkrc-2.0`, nothing more. Your desktop's own session settings — Plasma's `kdeglobals`, GNOME's extension list, panel layouts, keybindings — are **not** in the default manifest, because they are the part most likely to fight you across a version change. Add the paths you actually want under `[extra]`, or lean on `dconf export` where the desktop stores its settings there.
 
 ## Install
 
@@ -52,7 +89,15 @@ Backup also writes `packages/dev-apps.json` — Cursor, VS Code, Docker, nvm, py
 
 Copy `~/Backups/distrohop/` onto a USB, or commit the clone map (`dev/repos.tsv`, `dev/clone-dev.sh`) with this repo.
 
-Old snapshots pile up — `distrohop prune` deletes everything but the 10 most recent (`--keep N` to change that, `--dry-run` to preview).
+Every backup writes a `SHA256SUMS` covering the whole snapshot, so you can ask whether one is still intact before you bet a reinstall on it:
+
+```bash
+distrohop verify workstation
+```
+
+Pass `--no-verify` to `backup` to skip checksumming (and to `s3 push`/`s3 pull` to skip the remote comparison).
+
+Old snapshots pile up — `distrohop prune` deletes everything but the 10 most recent (`--keep N` to change that, `--dry-run` to preview). Both `prune` and `s3 prune` order snapshots by the date recorded inside them, not by name, so a custom `--name` never confuses "oldest".
 
 `distrohop list` (alias `ls`) shows every local snapshot, newest first, with its size. If `s3.conf` is set up it also checks the remote (one `rclone` call, 5s timeout) and marks each snapshot `✔ pushed` or `— local only`, so you never have to wonder if last night's backup actually made it off the machine.
 
@@ -96,7 +141,11 @@ Leftover `*.pre-hop.*` backups from past restores don't clean themselves up — 
 
 ## S3 / Cloudflare R2
 
-Uploads the **whole** snapshot, including `secrets/`, `.env` files, and docker volumes — this is the "distro dies, laptop gets stolen, house burns down" tier of backup, not just a local safety net.
+Uploads the **whole** snapshot — `.env` files, docker volumes, and (with `--secrets`) `secrets/` too. This is the "distro dies, laptop gets stolen, house burns down" tier of backup, not just a local safety net.
+
+Snapshot **contents are encrypted on this machine before upload** whenever `password=` is set in `s3.conf` (`distrohop s3 configure` generates one for you). It uses `rclone crypt`, so private keys, `.env` files, database dumps and `rclone.conf` never reach the bucket as plaintext. Snapshot and file *names* stay readable on purpose — `s3 ls`, `s3 prune`, `delete` and the `S3` column in `list` all work off names, and scrambling them buys little once the contents are sealed. Leave `password=` empty to upload in the clear; push will warn each time that you are.
+
+> The password lives in `s3.conf` next to the keys, so the offline copy of that file you already need is also the only copy of the encryption key. Lose it and the snapshots in the bucket are unrecoverable. Changing it strands everything already uploaded — set it once, before the first push.
 
 Objects land at `bucket/<snapshot-name>` (for example `distrohop/workstation`). Leave `prefix=` empty in `s3.conf` — a non-empty prefix would nest an extra folder inside the bucket.
 
@@ -115,15 +164,19 @@ distrohop restore workstation --pull --gh
 Keys can be imported from any `.env` file with `R2_ACCOUNT_ID` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` set (`distrohop s3 configure ENVFILE`). The bucket is always **`distrohop`** — create that in the R2 dashboard.
 
 ```bash
-distrohop s3 configure ~/path/to/project/.env  # import R2 keys → s3.conf
-distrohop s3 push workstation                  # upload an existing snapshot (adds secrets)
-distrohop s3 push                              # take a full backup (with secrets) and upload
+distrohop s3 configure ~/path/to/project/.env  # import R2 keys + generate a password → s3.conf
+distrohop s3 push workstation                  # upload an existing snapshot, as-is
+distrohop s3 push workstation --secrets        # ...and add ssh keys / gh hosts / rclone.conf first
+distrohop s3 push                              # take a backup now and upload it
+distrohop s3 push --secrets                    # ...including secrets
 distrohop s3 ls
 distrohop s3 pull workstation
 distrohop s3 prune --keep 5                    # delete all but the 5 newest remote snapshots
 ```
 
-Every push/pull is checksum-verified against the remote afterward (`--no-verify` to skip) — silent corruption is a worse failure mode than a loud one.
+`s3 push` never adds secrets to a snapshot on its own: a snapshot taken without `--secrets` uploads without them unless you ask again at push time. Secrets are opt-in at every step, never implied.
+
+Every push/pull is checksum-verified against the remote afterward (`--no-verify` to skip) — silent corruption is a worse failure mode than a loud one. Encrypted remotes are verified with `rclone cryptcheck`, which compares the real plaintext, not just sizes.
 
 If an older push created a `distrohop/` folder inside the bucket, those objects are at `distrohop/distrohop/<name>`. Re-push after this fix, or copy them up one level in the R2 dashboard.
 
@@ -131,7 +184,7 @@ Desktop settings (dconf) can be saved and reloaded with `distrohop dconf export`
 
 ## Scheduled backups (systemd)
 
-`systemd/` ships a user timer that runs `distrohop backup --secrets --push` once a day, so "I'll back up before I reinstall" stops being a lie you tell yourself. It uses the `%h` specifier and `hostname -s`, so it works as-is on any machine — nothing to edit.
+`systemd/` ships a user timer that runs `distrohop backup --secrets --push` once a day (`--secrets` on the backup is what puts them in the snapshot the push then uploads), so "I'll back up before I reinstall" stops being a lie you tell yourself. It uses the `%h` specifier and `hostname -s`, so it works as-is on any machine — nothing to edit.
 
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -154,3 +207,24 @@ Edit what gets copied: `distrohop edit`.
 ## What this isn't
 
 Worth saying plainly: distrohop is not a full-system image tool, not a dotfiles-as-symlinks manager, and not a substitute for real backups of things you can't regenerate (photos, databases, anything precious). It's narrowly good at one job — carrying configuration and dev-environment state across a reinstall — and it stays out of the way of everything else on purpose.
+
+## Hacking on it
+
+There's no build step. The entrypoint is `./distrohop`; everything else lives in `lib/`.
+
+```bash
+tests/smoke.sh                       # end-to-end backup/restore in a throwaway $HOME
+shellcheck -S warning distrohop lib/*.sh tests/smoke.sh
+```
+
+`tests/smoke.sh` never touches your real home or your real snapshots — it points `HOME`, `XDG_CONFIG_HOME` and `DISTROHOP_DIR` at a temp tree and deletes it afterward. Both commands run in CI on every push, and the smoke suite also runs in Arch, Fedora, Debian and openSUSE containers so each package-manager branch gets exercised.
+
+To try a command by hand without writing to `~/Backups`:
+
+```bash
+DISTROHOP_DIR=/tmp/dh-test ./distrohop backup --name smoke --dest /tmp/dh-test
+```
+
+## License
+
+MIT — see [LICENSE](LICENSE).

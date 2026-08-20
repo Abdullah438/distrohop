@@ -1,3 +1,5 @@
+# shellcheck shell=bash
+# shellcheck disable=SC2034  # UI_* globals are consumed by the main script
 # sourced by distrohop — interactive checklist (restore picker)
 
 # UI_IDS[], UI_LABELS[], UI_ON[] (0|1)

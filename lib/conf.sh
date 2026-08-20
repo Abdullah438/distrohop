@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # sourced by distrohop — generic key=value config-file loader
 # shellcheck disable=SC2034
 
