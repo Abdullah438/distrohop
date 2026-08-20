@@ -1,10 +1,10 @@
 [Unit]
-Description=Run distrohop backup daily at 9pm
+Description=Run keepsake backup daily at 9pm
 
 [Timer]
 OnCalendar=*-*-* 21:00:00
 Persistent=true
-Unit=distrohop-backup.service
+Unit=keepsake-backup.service
 
 [Install]
 WantedBy=timers.target

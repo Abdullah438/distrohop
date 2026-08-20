@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# sourced by distrohop — generic key=value config-file loader
+# sourced by keepsake — generic key=value config-file loader
 # shellcheck disable=SC2034
 
 # conf_load_kv FILE KEY... — reads FILE (comments/blanks ignored, split on

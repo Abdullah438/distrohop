@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# distrohop — snapshot the configs that survive a distro hop, then put them back.
+# keepsake — snapshot configs, packages, and dev-environment state, then put them back.
 set -euo pipefail
 
 VERSION="1.4.0"
@@ -13,8 +13,30 @@ done
 SCRIPT_DIR=$(cd "$(dirname "$SOURCE")" && pwd)
 unset _dir SOURCE
 
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/distrohop"
-DATA_DIR="${DISTROHOP_DIR:-$HOME/Backups/distrohop}"
+# Prefer the new paths. If this is an upgrade from distrohop and only the
+# old config / snapshot dir exists, keep using it so s3.conf and snapshots
+# don't vanish under a new name.
+_cfg_root="${XDG_CONFIG_HOME:-$HOME/.config}"
+if [[ -d $_cfg_root/keepsake ]]; then
+  CONFIG_DIR="$_cfg_root/keepsake"
+elif [[ -d $_cfg_root/distrohop ]]; then
+  CONFIG_DIR="$_cfg_root/distrohop"
+else
+  CONFIG_DIR="$_cfg_root/keepsake"
+fi
+unset _cfg_root
+
+if [[ -n ${KEEPSAKE_DIR:-} ]]; then
+  DATA_DIR=$KEEPSAKE_DIR
+elif [[ -n ${DISTROHOP_DIR:-} ]]; then
+  DATA_DIR=$DISTROHOP_DIR
+elif [[ -d $HOME/Backups/keepsake ]]; then
+  DATA_DIR=$HOME/Backups/keepsake
+elif [[ -d $HOME/Backups/distrohop ]]; then
+  DATA_DIR=$HOME/Backups/distrohop
+else
+  DATA_DIR=$HOME/Backups/keepsake
+fi
 MANIFEST="$CONFIG_DIR/manifest.conf"
 SETTINGS_CONF="${SETTINGS_CONF:-$CONFIG_DIR/settings.conf}"
 
@@ -65,26 +87,26 @@ die()  { err "$*"; exit 1; }
 
 usage() {
   cat <<EOF
-${C_BOLD}distrohop${C_RESET} ${C_DIM}v$VERSION${C_RESET} — backup the configs that survive a distro hop
+${C_BOLD}keepsake${C_RESET} ${C_DIM}v$VERSION${C_RESET} — snapshot configs, packages, and the rest of a working machine
 
 ${C_BOLD}USAGE${C_RESET}
-  distrohop backup  [--name NAME] [--dest DIR] [--groups LIST] [--with LIST] [--secrets] [--archive] [--push]
-  distrohop restore SNAPSHOT [--groups LIST] [--with LIST] [--secrets] [--up] [--yes] [--dry-run] [--pull]
-  distrohop clone   [SNAPSHOT] [--gh] [--dry-run]
-  distrohop prune   [--keep N] [--dry-run]
-  distrohop delete  NAME [--local-only|--s3-only] [--dry-run]   (alias: rm)
-  distrohop clean   [--older-than DAYS] [--dry-run]
-  distrohop s3      configure ENVFILE | push [SNAPSHOT] [--secrets] [--no-verify] | pull NAME [--no-verify] | ls | prune [--keep N]
-  distrohop list    (alias: ls)   — newest first, shows S3 push status if s3 is configured
-  distrohop show    SNAPSHOT
-  distrohop verify  SNAPSHOT
-  distrohop status  [--groups LIST]
-  distrohop packages dump | apply [--portable] [--dry-run]
-  distrohop bootstrap [--dry-run]
-  distrohop dconf   export | import [FILE]
-  distrohop config  get|set KEY [VALUE]
-  distrohop edit
-  distrohop install
+  keepsake backup  [--name NAME] [--dest DIR] [--groups LIST] [--with LIST] [--secrets] [--archive] [--push]
+  keepsake restore SNAPSHOT [--groups LIST] [--with LIST] [--secrets] [--up] [--yes] [--dry-run] [--pull]
+  keepsake clone   [SNAPSHOT] [--gh] [--dry-run]
+  keepsake prune   [--keep N] [--dry-run]
+  keepsake delete  NAME [--local-only|--s3-only] [--dry-run]   (alias: rm)
+  keepsake clean   [--older-than DAYS] [--dry-run]
+  keepsake s3      configure ENVFILE | push [SNAPSHOT] [--secrets] [--no-verify] | pull NAME [--no-verify] | ls | prune [--keep N]
+  keepsake list    (alias: ls)   — newest first, shows S3 push status if s3 is configured
+  keepsake show    SNAPSHOT
+  keepsake verify  SNAPSHOT
+  keepsake status  [--groups LIST]
+  keepsake packages dump | apply [--portable] [--dry-run]
+  keepsake bootstrap [--dry-run]
+  keepsake dconf   export | import [FILE]
+  keepsake config  get|set KEY [VALUE]
+  keepsake edit              — manifest (micro if installed, else \$EDITOR)
+  keepsake install
 
 ${C_BOLD}BACKUP GROUPS${C_RESET}  (default: ${DEFAULT_GROUPS[*]})
   core         zsh, p10k, bash, git, nano
@@ -96,35 +118,35 @@ ${C_BOLD}BACKUP GROUPS${C_RESET}  (default: ${DEFAULT_GROUPS[*]})
   secrets      ssh private keys, gh hosts, rclone.conf  ${C_DIM}(opt-in)${C_RESET}
   extra        whatever you add under [extra] in the manifest
 
-${C_BOLD}SETTINGS${C_RESET}  (distrohop config get|set KEY VALUE)
-  dev_root     where your dev tree lives (default: ~/Dev, or \$DISTROHOP_DEV for a one-off override)
+${C_BOLD}SETTINGS${C_RESET}  (keepsake config get|set KEY VALUE)
+  dev_root     where your dev tree lives (default: ~/Dev, or \$KEEPSAKE_DEV for a one-off override)
 
 ${C_BOLD}EXAMPLES${C_RESET}
-  distrohop backup --name workstation
-  distrohop backup --secrets
-  distrohop backup --secrets --push             # backup, then upload to S3/R2
-  distrohop backup --dest /run/media/$USER_DISPLAY/USB --archive --secrets
-  distrohop restore workstation                 # checkbox picker
-  distrohop restore workstation --yes           # defaults, no prompt
-  distrohop restore workstation --pull          # download from S3/R2 first
-  distrohop restore workstation --up
-  distrohop clone workstation --gh
-  distrohop prune --keep 5
-  distrohop delete workstation                  # remove local + remote copy
-  distrohop delete workstation --local-only
-  distrohop delete workstation --s3-only
-  distrohop clean --older-than 30
-  distrohop s3 push workstation                 # upload as-is
-  distrohop s3 push workstation --secrets       # ...and add ssh keys / rclone.conf
-  distrohop s3 pull workstation
-  distrohop verify workstation                  # checksum a local snapshot
-  distrohop s3 prune --keep 5
-  distrohop packages apply --portable
-  distrohop bootstrap
-  distrohop config set dev_root ~/Projects
+  keepsake backup --name workstation
+  keepsake backup --secrets
+  keepsake backup --secrets --push             # backup, then upload to S3/R2
+  keepsake backup --dest /run/media/$USER_DISPLAY/USB --archive --secrets
+  keepsake restore workstation                 # checkbox picker
+  keepsake restore workstation --yes           # defaults, no prompt
+  keepsake restore workstation --pull          # download from S3/R2 first
+  keepsake restore workstation --up
+  keepsake clone workstation --gh
+  keepsake prune --keep 5
+  keepsake delete workstation                  # remove local + remote copy
+  keepsake delete workstation --local-only
+  keepsake delete workstation --s3-only
+  keepsake clean --older-than 30
+  keepsake s3 push workstation                 # upload as-is
+  keepsake s3 push workstation --secrets       # ...and add ssh keys / rclone.conf
+  keepsake s3 pull workstation
+  keepsake verify workstation                  # checksum a local snapshot
+  keepsake s3 prune --keep 5
+  keepsake packages apply --portable
+  keepsake bootstrap
+  keepsake config set dev_root ~/Projects
 
 Snapshots land in ${C_CYN}$DATA_DIR${C_RESET}
-Edit what gets copied: ${C_CYN}distrohop edit${C_RESET}
+Edit what gets copied: ${C_CYN}keepsake edit${C_RESET}
 EOF
 }
 
@@ -478,7 +500,7 @@ write_notes() {
   fi
 
   cat > "$snap/NOTES.txt" <<EOF
-distrohop snapshot
+keepsake snapshot
 ==================
 date:     $(date -Iseconds)
 host:     $host
@@ -487,24 +509,24 @@ desktop:  $de
 home:     $HOME
 groups:   $(active_groups | tr '\n' ' ')
 
-Restore on the new machine
---------------------------
-1. Copy this folder (or the .tar.zst) onto the new install.
-2. Put distrohop on PATH (or run it from this repo):
-     ./distrohop install
+Restore
+-------
+1. Copy this folder (or the .tar.zst) onto the machine you're restoring to.
+2. Put keepsake on PATH (or run it from this repo):
+     ./keepsake install
 3. Restore configs (existing files are saved as *.pre-hop.*):
-     distrohop restore $snap
+     keepsake restore $snap
 4. Reinstall the shell stack (zsh, p10k, plugins, fonts):
-     distrohop bootstrap
+     keepsake bootstrap
 5. Reinstall portable packages (DE session packages are listed separately):
-     distrohop packages apply --portable
+     keepsake packages apply --portable
 
 Notes
 -----
 - zshrc sources system paths (/usr/share/oh-my-zsh, p10k, zsh plugins) on
   Arch, where bootstrap installs them as system packages. On dnf/apt/zypper,
   bootstrap instead git-clones oh-my-zsh/p10k/plugins into
-  ~/.local/share/distrohop/zsh-plugins — .zshrc may need updating to source
+  ~/.local/share/keepsake/zsh-plugins — .zshrc may need updating to source
   from there instead.
 - git commit signing uses ~/.ssh/id_ed25519_gitsign — restore with --secrets
   or copy that key by hand.
@@ -520,9 +542,9 @@ Restore asks what to put back (checkboxes). Skip the prompt with --yes.
 ~/Dev
 -----
 Git repos are NOT copied. The snapshot records remotes + folder layout.
-On the new machine:
+To rebuild the tree:
 
-    distrohop clone $snap
+    keepsake clone $snap
     # or:  $snap/dev/clone-dev.sh
 
 That recreates the repos this snapshot mapped under $DEV_ROOT${dev_examples:+ (e.g. $dev_examples, …)} and
@@ -532,7 +554,7 @@ or SSH keys (--secrets).
 .env files, compose bind-mounts, and named docker volumes live under
 dev/envs, dev/bind, dev/volumes. They are gitignored on purpose — keep
 them off a public remote. Restore brings them back automatically.
-Then start stacks with:  distrohop restore $snap --up
+Then start stacks with:  keepsake restore $snap --up
 
 Secrets
 -------
@@ -551,7 +573,7 @@ write_meta() {
   date -Iseconds > "$snap/meta/date"
   uname -a > "$snap/meta/uname"
   printf '%s\n' "$HOME" > "$snap/meta/home"
-  printf '%s\n' "$VERSION" > "$snap/meta/distrohop-version"
+  printf '%s\n' "$VERSION" > "$snap/meta/keepsake-version"
   active_groups > "$snap/meta/groups"
 }
 
@@ -559,7 +581,7 @@ write_meta() {
 # Snapshot integrity
 # ---------------------------------------------------------------------------
 
-# Hash every file in the finished snapshot so `distrohop verify` can answer
+# Hash every file in the finished snapshot so `keepsake verify` can answer
 # "is this snapshot still intact?" without a network round-trip. Skipped by
 # --no-verify, and never fatal — a snapshot without SHA256SUMS is still a
 # usable snapshot.
@@ -608,7 +630,7 @@ cmd_verify() {
 # Cleanup of *.pre-hop.* leftovers from past restores
 # ---------------------------------------------------------------------------
 
-# HOME-relative roots distrohop could have written a *.pre-hop.* backup
+# HOME-relative roots keepsake could have written a *.pre-hop.* backup
 # under: every manifest path across all file groups, plus $DEV_ROOT.
 clean_scan_roots() {
   local g rel
@@ -712,7 +734,7 @@ resolve_snapshot() {
       return
     fi
   done
-  die "snapshot not found: $arg  (try: distrohop list)"
+  die "snapshot not found: $arg  (try: keepsake list)"
 }
 
 # ---------------------------------------------------------------------------
@@ -720,11 +742,13 @@ resolve_snapshot() {
 # ---------------------------------------------------------------------------
 
 cmd_install() {
-  local dest="$HOME/.local/bin/distrohop"
+  local dest="$HOME/.local/bin/keepsake"
   mkdir -p "$HOME/.local/bin"
-  ln -sfn "$SCRIPT_DIR/distrohop" "$dest"
+  ln -sfn "$SCRIPT_DIR/keepsake" "$dest"
+  # Old command name kept as a symlink so existing timers and scripts keep working.
+  ln -sfn "$dest" "$HOME/.local/bin/distrohop"
   ensure_manifest
-  ok "linked $dest → $SCRIPT_DIR/distrohop"
+  ok "linked $dest → $SCRIPT_DIR/keepsake"
   if [[ :$PATH: != *":$HOME/.local/bin:"* ]]; then
     warn "$HOME/.local/bin is not on PATH — add it, or open a new terminal"
   fi
@@ -738,14 +762,14 @@ cmd_config() {
   esac
   case $sub in
     get)
-      [[ -n $key ]] || die "usage: distrohop config get KEY"
+      [[ -n $key ]] || die "usage: keepsake config get KEY"
       local v=""
       conf_load_kv "$SETTINGS_CONF" "$key" 2>/dev/null || true
       v=${!key:-}
       printf '%s\n' "$v"
       ;;
     set)
-      [[ -n $key ]] || die "usage: distrohop config set KEY VALUE"
+      [[ -n $key ]] || die "usage: keepsake config set KEY VALUE"
       mkdir -p "$CONFIG_DIR"
       touch "$SETTINGS_CONF"
       local tmp="$SETTINGS_CONF.tmp"
@@ -754,13 +778,18 @@ cmd_config() {
       mv "$tmp" "$SETTINGS_CONF"
       ok "$key=$val → $SETTINGS_CONF"
       ;;
-    *) die "usage: distrohop config get|set KEY [VALUE]" ;;
+    *) die "usage: keepsake config get|set KEY [VALUE]" ;;
   esac
 }
 
 cmd_edit() {
   ensure_manifest
-  local editor=${EDITOR:-${VISUAL:-nano}}
+  local editor
+  if command -v micro >/dev/null 2>&1; then
+    editor=micro
+  else
+    editor=${EDITOR:-${VISUAL:-nano}}
+  fi
   exec "$editor" "$MANIFEST"
 }
 
@@ -904,7 +933,7 @@ cmd_backup() {
   fi
 
   printf '\n%sNext%s\n' "$C_BOLD" "$C_RESET"
-  printf '  restore:   distrohop restore %s\n' "$name"
+  printf '  restore:   keepsake restore %s\n' "$name"
   printf '  portable:  %s packages\n' "$(wc -l < "$dest/packages/portable.txt")"
   if [[ -s $dest/packages/kde-session.txt ]]; then
     printf '  desktop:   %s DE-session packages (packages/kde-session.txt)\n' "$(wc -l < "$dest/packages/kde-session.txt")"
@@ -1042,7 +1071,7 @@ cmd_prune() {
 
 cmd_delete() {
   local name=${1:-}
-  [[ -n $name ]] || die "usage: distrohop delete NAME [--local-only|--s3-only] [--dry-run]"
+  [[ -n $name ]] || die "usage: keepsake delete NAME [--local-only|--s3-only] [--dry-run]"
   (( WANT_LOCAL_ONLY && WANT_S3_ONLY )) && die "--local-only and --s3-only are mutually exclusive"
 
   local do_local=1 do_s3=1
@@ -1096,7 +1125,7 @@ cmd_delete() {
         die "no remote snapshot named $name"
       fi
     elif (( WANT_S3_ONLY )); then
-      die "no s3 config — can't delete remote copy (distrohop s3 configure ENVFILE)"
+      die "no s3 config — can't delete remote copy (keepsake s3 configure ENVFILE)"
     fi
   fi
 
@@ -1126,7 +1155,7 @@ cmd_restore() {
   local snap
 
   if (( WANT_PULL )); then
-    [[ -n ${1:-} ]] || die "usage: distrohop restore NAME --pull"
+    [[ -n ${1:-} ]] || die "usage: keepsake restore NAME --pull"
     declare -F cmd_s3_pull >/dev/null || die "s3 pull unavailable (lib/s3.sh missing)"
     cmd_s3_pull "$1"
   fi
@@ -1195,7 +1224,7 @@ cmd_restore() {
     fi
     ok "restored $restored items"
     info "existing files were saved as *.pre-hop.*"
-    info "next: distrohop bootstrap   then   distrohop packages apply --portable"
+    info "next: keepsake bootstrap   then   keepsake packages apply --portable"
   else
     ok "dry-run finished ($restored items would restore)"
   fi
@@ -1207,7 +1236,7 @@ cmd_clone() {
     snap=$(resolve_snapshot "$1")
   else
     snap=$(latest_snapshot_dir)
-    [[ -n $snap ]] || die "no snapshot found — pass one: distrohop clone workstation"
+    [[ -n $snap ]] || die "no snapshot found — pass one: keepsake clone workstation"
   fi
   [[ -x $snap/dev/clone-dev.sh ]] || die "no clone map in $snap (backup with the dev group)"
   local args=()
@@ -1355,7 +1384,7 @@ cmd_bootstrap() {
   else
     # No AUR-equivalent on dnf/apt/zypper: install what's packaged, git-clone
     # the rest (oh-my-zsh, p10k, plugins) instead of running oh-my-zsh's
-    # interactive installer (it mutates .zshrc, which distrohop restores
+    # interactive installer (it mutates .zshrc, which keepsake restores
     # separately as the user's own file).
     local repo_names=(zsh fzf bat trash-cli fastfetch alacritty git github-cli)
     info "shell + prompt + fonts that your zshrc expects ($pm)"
@@ -1373,14 +1402,14 @@ cmd_bootstrap() {
     if (( DRY_RUN )); then
       printf '%s: %s\n' "$pm" "${resolved[*]}"
       ((${#unresolved[@]})) && printf 'no package found for: %s\n' "${unresolved[*]}"
-      printf 'git-clone → ~/.local/share/distrohop/zsh-plugins: oh-my-zsh, powerlevel10k, zsh-autosuggestions, zsh-syntax-highlighting, zsh-history-substring-search\n'
+      printf 'git-clone → ~/.local/share/keepsake/zsh-plugins: oh-my-zsh, powerlevel10k, zsh-autosuggestions, zsh-syntax-highlighting, zsh-history-substring-search\n'
       return 0
     fi
 
     ((${#resolved[@]})) && { pm_install_batch "$pm" "${resolved[@]}" || warn "some repo packages failed"; }
     ((${#unresolved[@]})) && warn "no $pm package for: ${unresolved[*]} — install by hand"
 
-    local plugdir="$HOME/.local/share/distrohop/zsh-plugins"
+    local plugdir="$HOME/.local/share/keepsake/zsh-plugins"
     mkdir -p "$plugdir"
     local -A clones=(
       [oh-my-zsh]=https://github.com/ohmyzsh/ohmyzsh.git
@@ -1445,7 +1474,7 @@ cmd_bootstrap() {
 
 cmd_dconf() {
   local sub=${1:-}
-  local file=${2:-$HOME/.config/distrohop/dconf.ini}
+  local file=${2:-$CONFIG_DIR/dconf.ini}
   case $sub in
     export)
       command -v dconf >/dev/null 2>&1 || die "dconf not installed"
@@ -1455,12 +1484,12 @@ cmd_dconf() {
       ;;
     import)
       command -v dconf >/dev/null 2>&1 || die "dconf not installed"
-      [[ -f $file ]] || die "no dump at $file — run: distrohop dconf export"
+      [[ -f $file ]] || die "no dump at $file — run: keepsake dconf export"
       dconf load / < "$file"
       ok "loaded $file into dconf"
       ;;
     *)
-      die "usage: distrohop dconf export|import [FILE]"
+      die "usage: keepsake dconf export|import [FILE]"
       ;;
   esac
 }
@@ -1512,15 +1541,15 @@ case $cmd in
   backup) cmd_backup ;;
   list|ls) cmd_list ;;
   show)
-    [[ $# -ge 1 ]] || die "usage: distrohop show SNAPSHOT"
+    [[ $# -ge 1 ]] || die "usage: keepsake show SNAPSHOT"
     cmd_show "$1"
     ;;
   verify)
-    [[ $# -ge 1 ]] || die "usage: distrohop verify SNAPSHOT"
+    [[ $# -ge 1 ]] || die "usage: keepsake verify SNAPSHOT"
     cmd_verify "$1"
     ;;
   restore)
-    [[ $# -ge 1 ]] || die "usage: distrohop restore SNAPSHOT"
+    [[ $# -ge 1 ]] || die "usage: keepsake restore SNAPSHOT"
     cmd_restore "$1"
     ;;
   clone)
@@ -1528,7 +1557,7 @@ case $cmd in
     ;;
   prune) cmd_prune ;;
   delete|rm)
-    [[ $# -ge 1 ]] || die "usage: distrohop delete NAME [--local-only|--s3-only]"
+    [[ $# -ge 1 ]] || die "usage: keepsake delete NAME [--local-only|--s3-only]"
     cmd_delete "$1"
     ;;
   clean) cmd_clean ;;
@@ -1538,11 +1567,11 @@ case $cmd in
     case $sub in
       dump) cmd_packages_dump ;;
       apply) cmd_packages_apply "$PORTABLE" "${2:-}" ;;
-      *) die "usage: distrohop packages dump|apply [--portable]" ;;
+      *) die "usage: keepsake packages dump|apply [--portable]" ;;
     esac
     ;;
   bootstrap) cmd_bootstrap ;;
   dconf) cmd_dconf "${1:-}" "${2:-}" ;;
   s3) cmd_s3 "$@" ;;
-  *) die "unknown command: $cmd  (try: distrohop help)" ;;
+  *) die "unknown command: $cmd  (try: keepsake help)" ;;
 esac

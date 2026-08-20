@@ -14,9 +14,9 @@ jobs:
       - name: Install shellcheck
         run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
       - name: Syntax check
-        run: bash -n distrohop lib/*.sh tests/smoke.sh
+        run: bash -n keepsake lib/*.sh tests/smoke.sh
       - name: Lint
-        run: shellcheck -S warning distrohop lib/*.sh tests/smoke.sh
+        run: shellcheck -S warning keepsake lib/*.sh tests/smoke.sh
 
   smoke:
     name: smoke (ubuntu)
